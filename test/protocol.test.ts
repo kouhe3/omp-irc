@@ -1,0 +1,302 @@
+/**
+ * IRC 协议层测试：分帧/解析/切分（假 socket，无网络）+ 真实 TCP 的注册/PING/JOIN/
+ * 433 换名/断线重连（mock IRC server）。
+ *
+ * 全是事件驱动的等待（`Gate` / `server.waitForLine` / `server.waitUntil`），不睡真实时间。
+ */
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+	IrcClient,
+	MAX_IRC_BYTES,
+	parseIrcLine,
+	payloadBudget,
+	splitByBytes,
+	type IrcClientOptions,
+	type IrcInboundMessage,
+	type IrcSocket,
+	type IrcTimers,
+} from "../src/client";
+import { createGate, startMockIrcServer, type MockIrcServer } from "./mock-irc-server";
+
+const servers: MockIrcServer[] = [];
+const clients: IrcClient[] = [];
+
+async function startServer(options?: Parameters<typeof startMockIrcServer>[0]): Promise<MockIrcServer> {
+	const server = await startMockIrcServer(options);
+	servers.push(server);
+	return server;
+}
+
+function startClient(server: MockIrcServer, overrides: Partial<IrcClientOptions> = {}): IrcClient {
+	const client = new IrcClient({
+		host: server.host,
+		port: server.port,
+		nick: "omp",
+		channels: ["#omp"],
+		// 测试要快：真实退避是 500ms 起。
+		reconnect: { base: 20, max: 80 },
+		...overrides,
+	});
+	clients.push(client);
+	client.start();
+	return client;
+}
+
+afterEach(async () => {
+	for (const client of clients.splice(0)) client.stop();
+	for (const server of servers.splice(0)) await server.close();
+});
+
+/** 假 socket：把事件面暴露给测试、记录写出的原始行。 */
+class FakeSocket implements IrcSocket {
+	readonly writes: string[] = [];
+	readonly #listeners = new Map<string, ((arg?: unknown) => void)[]>();
+
+	write(data: string): boolean {
+		this.writes.push(data);
+		return true;
+	}
+
+	end(): void {}
+
+	destroy(): void {}
+
+	on(event: "connect", listener: () => void): unknown;
+	on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
+	on(event: "error", listener: (error: Error) => void): unknown;
+	on(event: "close", listener: () => void): unknown;
+	on(event: string, listener: (...args: never[]) => void): unknown {
+		// 实现签名只要求「能被 on 收下」；客户端用到的四个事件都 ≤1 个参数，测试按单参调用。
+		const handler = listener as (arg?: unknown) => void;
+		const listeners = this.#listeners.get(event) ?? [];
+		listeners.push(handler);
+		this.#listeners.set(event, listeners);
+		return this;
+	}
+
+	emit(event: string, arg?: unknown): void {
+		for (const listener of this.#listeners.get(event) ?? []) listener(arg);
+	}
+}
+
+/** 假定时器：只记录延迟，由测试手动触发下一个回调（退避序列因此是确定性的）。 */
+class FakeTimers implements IrcTimers {
+	readonly delays: number[] = [];
+	readonly #pending: (() => void)[] = [];
+
+	setTimeout(callback: () => void, ms: number): unknown {
+		this.delays.push(ms);
+		this.#pending.push(callback);
+		return callback;
+	}
+
+	clearTimeout(): void {
+		this.#pending.length = 0;
+	}
+
+	runNext(): void {
+		this.#pending.shift()?.();
+	}
+}
+
+describe("splitByBytes / payloadBudget（512 字节上限）", () => {
+	test("多字节字符不被切碎，每块不超预算，拼回原文", () => {
+		const text = "中".repeat(300);
+		const chunks = splitByBytes(text, 100);
+		expect(chunks.length).toBeGreaterThan(1);
+		for (const chunk of chunks) expect(Buffer.byteLength(chunk, "utf8")).toBeLessThanOrEqual(100);
+		expect(chunks.join("")).toBe(text);
+	});
+
+	test("换行是硬断点；长行优先在空格处断开", () => {
+		expect(splitByBytes("abc\ndef", 20)).toEqual(["abc", "def"]);
+		const chunks = splitByBytes("aaaa bbbb cccc dddd", 10);
+		for (const chunk of chunks) expect(Buffer.byteLength(chunk, "utf8")).toBeLessThanOrEqual(10);
+		expect(chunks.join(" ")).toBe("aaaa bbbb cccc dddd");
+	});
+
+	test("payloadBudget 把 `:nick!user@host PRIVMSG target :` + CRLF 扣掉", () => {
+		// 512 - (1 + 3 + 1 + 3 + 1 + 63 + 1 + 7 + 1 + 4 + 2 + 2)
+		expect(payloadBudget("PRIVMSG", "omp", "omp", "#omp")).toBe(MAX_IRC_BYTES - 89);
+	});
+});
+
+describe("IrcClient（假 socket：分帧与退避）", () => {
+	test("一次 data 里的半行 + 多行都能解析（CRLF 分帧）", () => {
+		const socket = new FakeSocket();
+		const client = new IrcClient({ host: "mock", port: 6667, nick: "omp", socketFactory: () => socket });
+		clients.push(client);
+		const seen: IrcInboundMessage[] = [];
+		client.onPrivmsg = message => seen.push(message);
+		client.start();
+		socket.emit("connect");
+		expect(socket.writes).toEqual(["NICK omp\r\n", "USER omp 0 * :omp IRC channel\r\n"]);
+
+		socket.emit("data", ":alice!a@h PRIVMSG omp :par");
+		expect(seen).toHaveLength(0);
+		socket.emit("data", "tial\r\n:bob!b@h PRIVMSG omp :two\r\n");
+		expect(seen.map(message => message.text)).toEqual(["partial", "two"]);
+		expect(seen[0]?.from).toBe("alice");
+		expect(seen[0]?.channel).toBe(false);
+	});
+
+	test("断线按指数退避重连（20 → 40 → 80 → 封顶 80），连上后退避归零", () => {
+		const sockets: FakeSocket[] = [];
+		const timers = new FakeTimers();
+		const client = new IrcClient({
+			host: "mock",
+			port: 6667,
+			nick: "omp",
+			socketFactory: () => {
+				const socket = new FakeSocket();
+				sockets.push(socket);
+				return socket;
+			},
+			reconnect: { base: 20, max: 80 },
+			timers,
+		});
+		clients.push(client);
+		client.start();
+		expect(sockets).toHaveLength(1);
+
+		for (let round = 0; round < 4; round++) {
+			sockets.at(-1)?.emit("close");
+			expect(timers.delays.at(-1)).toBe(Math.min(80, 20 * 2 ** round));
+			timers.runNext();
+		}
+		expect(sockets).toHaveLength(5);
+		expect(timers.delays).toEqual([20, 40, 80, 80]);
+
+		sockets.at(-1)?.emit("connect");
+		sockets.at(-1)?.emit("close");
+		expect(timers.delays.at(-1)).toBe(20);
+	});
+
+	test("stop 之后不再重连", () => {
+		const socket = new FakeSocket();
+		const timers = new FakeTimers();
+		const client = new IrcClient({ host: "mock", port: 6667, nick: "omp", socketFactory: () => socket, timers });
+		clients.push(client);
+		client.start();
+		client.stop();
+		socket.emit("close");
+		expect(timers.delays).toEqual([]);
+	});
+});
+
+describe("IrcClient（mock IRC server：真 TCP）", () => {
+	test("注册：NICK/USER → 001 → JOIN 配置的频道", async () => {
+		const server = await startServer();
+		const client = startClient(server);
+		await server.waitForNick("omp");
+		await server.waitForJoin("#omp");
+		expect(server.channelsOf("omp")).toContain("#omp");
+		expect(client.status()).toMatchObject({ connected: true, registered: true, nick: "omp" });
+		expect(server.received).toContain("USER omp 0 * :omp IRC channel");
+	});
+
+	test("PING → PONG（token 原样带回）", async () => {
+		const server = await startServer();
+		startClient(server);
+		await server.waitForNick("omp");
+		server.ping("tok-123");
+		expect(await server.waitForLine(/^PONG :tok-123$/)).toBe("PONG :tok-123");
+	});
+
+	test("注册完成前发出的正文排队，注册后按序补发（不静默丢消息）", async () => {
+		const server = await startServer();
+		const client = startClient(server);
+		// 这一行发出时 TCP 还没连上：必须排队，而不是被丢掉。
+		client.privmsg("alice", "early message");
+		await server.waitForJoin("#omp");
+		expect(await server.waitForLine(/^PRIVMSG alice :early message$/)).toBe("PRIVMSG alice :early message");
+		const lines = server.received;
+		expect(lines.indexOf("JOIN #omp")).toBeLessThan(lines.indexOf("PRIVMSG alice :early message"));
+	});
+
+	test("入站 PRIVMSG 私聊/频道、NOTICE、JOIN 事件", async () => {
+		const server = await startServer();
+		const gate = createGate();
+		const privmsgs: IrcInboundMessage[] = [];
+		const notices: IrcInboundMessage[] = [];
+		const joins: string[] = [];
+		const client = startClient(server, {
+			onPrivmsg: message => {
+				privmsgs.push(message);
+				gate.pump();
+			},
+			onNotice: message => {
+				notices.push(message);
+				gate.pump();
+			},
+			onJoin: event => {
+				joins.push(`${event.nick}->${event.channel}${event.self ? "(self)" : ""}`);
+				gate.pump();
+			},
+		});
+		await server.waitForNick("omp");
+		await server.waitForJoin("#omp");
+
+		server.simulatePrivmsg("alice", "omp", "你好");
+		server.simulatePrivmsg("bob", "#omp", "频道广播");
+		server.simulateNotice("carol", "omp", "悄悄话");
+		await gate.until(() => privmsgs.length >= 2 && notices.length >= 1 && joins.length >= 1, "客户端收到 2 条 PRIVMSG + 1 条 NOTICE");
+
+		expect(privmsgs.map(message => `${message.from}|${message.target}|${message.channel}|${message.text}`)).toEqual([
+			"alice|omp|false|你好",
+			"bob|#omp|true|频道广播",
+		]);
+		expect(notices.map(message => `${message.from}|${message.notice}|${message.text}`)).toEqual(["carol|true|悄悄话"]);
+		expect(joins).toContain("omp->#omp(self)");
+		expect(client.status().channels).toEqual(["#omp"]);
+	});
+
+	test("433 昵称被占用 → 自动换名并完成注册", async () => {
+		const server = await startServer({ takenNicks: ["omp"] });
+		const client = startClient(server);
+		await server.waitForNick("omp_");
+		expect(await server.waitForLine(/^NICK omp_$/)).toBe("NICK omp_");
+		expect(client.status().nick).toBe("omp_");
+	});
+
+	test("超长正文切成多条 PRIVMSG，每条（含 IRC 前缀）都不超 512 字节，拼回原文", async () => {
+		const server = await startServer();
+		const client = startClient(server);
+		await server.waitForNick("omp");
+		const text = "中".repeat(300);
+		client.privmsg("alice", text);
+		const chunks = (): string[] => server.received.filter(line => line.startsWith("PRIVMSG alice :"));
+		await server.waitUntil(() => chunks().length >= 2, "正文被切成至少两条");
+
+		const sent = chunks();
+		expect(sent.length).toBeGreaterThan(1);
+		for (const line of sent) expect(Buffer.byteLength(line, "utf8")).toBeLessThanOrEqual(MAX_IRC_BYTES);
+		expect(sent.map(line => parseIrcLine(line).params[1] ?? "").join("")).toBe(text);
+	});
+
+	test("socket 断开 → 自动重连并重新 JOIN", async () => {
+		const server = await startServer();
+		const client = startClient(server);
+		await server.waitForJoin("#omp");
+		const joins = (): number => server.received.filter(line => line === "JOIN #omp").length;
+		const before = joins();
+
+		server.dropAll();
+		await server.waitForConnections(0);
+		await server.waitUntil(() => joins() > before, "重连后重新 JOIN");
+		expect(client.status().registered).toBe(true);
+		expect(server.channelsOf("omp")).toContain("#omp");
+	});
+});
+
+describe("parseIrcLine", () => {
+	test("prefix / command / trailing 的常规形状", () => {
+		expect(parseIrcLine(":nick!user@host PRIVMSG #chan :hello : world")).toEqual({
+			prefix: "nick!user@host",
+			command: "PRIVMSG",
+			params: ["#chan", "hello : world"],
+		});
+		expect(parseIrcLine("PING :tok")).toEqual({ prefix: undefined, command: "PING", params: ["tok"] });
+		expect(parseIrcLine("JOIN #a,#b")).toEqual({ prefix: undefined, command: "JOIN", params: ["#a,#b"] });
+	});
+});

@@ -1,0 +1,24 @@
+{
+	"name": "omp-irc-channel",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "IRC 渠道扩展：让 omp 作为 IRC 客户端接入 IRC server，与 IRC 上的其它 agent 对等通话",
+	"omp": {
+		"extensions": [
+			"."
+		]
+	},
+	"scripts": {
+		"check": "bun x tsc --noEmit",
+		"test": "bun test",
+		"e2e": "bun run test/e2e-mock.ts",
+		"e2e:host": "bun run test/e2e-host.ts"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "18.6.1",
+		"@types/bun": "^1.4.2",
+		"@types/node": "^26.6.3",
+		"typescript": "^7.0.2"
+	}
+}
