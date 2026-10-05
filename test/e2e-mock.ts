@@ -323,6 +323,23 @@ try {
 		"生效的 env 覆盖逐条写进 notes",
 		fromEnv.notes.join(" / "),
 	);
+
+	// 心跳缺省关闭；IRC_KEEPALIVE_SECONDS 打开并写进 notes（客户端侧行为见 protocol.test.ts）。
+	check(bare.config.keepaliveSeconds === 0, "心跳缺省关闭", `keepaliveSeconds=${bare.config.keepaliveSeconds}`);
+	const keepaliveEnv = loadConfig(bareDir, {
+		env: { IRC_KEEPALIVE_SECONDS: "60", IRC_KEEPALIVE_TIMEOUT_SECONDS: "20" },
+		notes: [],
+	});
+	check(
+		keepaliveEnv.config.keepaliveSeconds === 60 && keepaliveEnv.config.keepaliveTimeoutSeconds === 20,
+		"IRC_KEEPALIVE_* 覆盖到配置",
+		`${keepaliveEnv.config.keepaliveSeconds}/${keepaliveEnv.config.keepaliveTimeoutSeconds}`,
+	);
+	check(
+		keepaliveEnv.notes.some(note => note.includes("心跳：每 60s 发 PING，20s 内无任何入站则判死重连")),
+		"心跳设置写进 notes",
+		keepaliveEnv.notes.join(" / "),
+	);
 } catch (error) {
 	check(false, "e2e 执行未抛错", error instanceof Error ? error.message : String(error));
 } finally {

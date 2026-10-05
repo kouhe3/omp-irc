@@ -48,11 +48,14 @@ bun run test/e2e-mock.ts    # 端到端（真 TCP + mock server + 真实扩展�
 | `channels` | `[]` | 启动即 JOIN 的频道；空则只收私聊 |
 | `password` | 无 | **连接密码**（IRC `PASS`），不是 SASL |
 | `transcriptDir` | `<agentDir>/irc-transcripts` | 每个 peer 的 jsonl 转录目录 |
+| `keepaliveSeconds` | `0`（关闭） | 心跳：静默这么久就主动 `PING :token`。真实 ircd 上的半开连接（看着在线、实际已死）靠它发现 |
+| `keepaliveTimeoutSeconds` | = `keepaliveSeconds` | 发出 `PING` 后这么久内**没有任何入站行**（服务端 PING、别人的消息都算）就判死：断开并走既有退避重连 |
 
 同名环境变量可覆盖（优先级高于文件，逐条日志会说明哪个生效）：
 
 `IRC_SERVER`、`IRC_PORT`、`IRC_TLS`、`IRC_NICK`、`IRC_CHANNELS`（逗号分隔）、
-`IRC_PASSWORD`、`IRC_TRANSCRIPT_DIR`、`IRC_CONFIG_PATH`（改配置文件位置，测试/多实例隔离用）。
+`IRC_PASSWORD`、`IRC_TRANSCRIPT_DIR`、`IRC_KEEPALIVE_SECONDS`、`IRC_KEEPALIVE_TIMEOUT_SECONDS`、
+`IRC_CONFIG_PATH`（改配置文件位置，测试/多实例隔离用）。
 
 ## 用法
 
@@ -142,8 +145,56 @@ peer id 规则：
 | 模型看不到消息 | 主会话未注册（headless/未启动）时入站只落转录并 warn 日志 |
 | 长消息看不全 | 主会话卡片正文有上限；用 `/irc log <peer>` 或 Hub 里 `⏎` 看转录 |
 | Hub 里 `⏎` 只得到「是外部渠道端点」的拒绝 | 宿主未支持 `transcriptOnly`（stock omp ≤ 18.6.1）：换支持它的 fork 宿主，或改用 `/irc log <peer>` |
+| 显示已连接但长时间收不到消息、对侧也看不到你 | 半开连接（NAT/防火墙掐断且不报错）：设 `keepaliveSeconds: 60`，超时判定后会自动重连 |
 
 日志全部带 `IRC` 前缀（`IRC 已注册` / `IRC 转录写入失败` / `IRC 入站投递失败` 等），连接目标与每个配置来源都会在 `session_start` 记一遍。
+
+## 自托管 ircd（本地测试 / 团队共用）
+
+**不要用 `jaredkrinke/pirc`**（实测，见 `docs` 外的复现）：`PING :token`（标准 trailing 形式）**完全不回 PONG**、`366 End of /NAMES` 排在 `353` 之前、numeric replies 不带 server 前缀、`353` 用逗号分隔昵称 —— 对老客户端尤其致命；且上游已归档，owner 自己说「用别人的 fork 吧」。另外它常被起在 SSH 前台会话里，session 一断进程就没了（看起来就像"服务端莫名消失"）。
+
+推荐 **Ergo**（单二进制、IRCv3、活跃维护；本机与共享服务器都用它）：
+
+```bash
+# 本地测试：一个二进制 + 一份最小配置
+curl -sLO https://github.com/ergochat/ergo/releases/download/v2.19.1/ergo-2.19.1-linux-x86_64.tar.gz
+#   Windows:     ...-windows-x86_64.zip
+tar -xzf ergo-2.19.1-linux-x86_64.tar.gz
+./ergo-2.19.1-linux-x86_64/ergo run --conf ircd.yaml
+```
+
+最小 `ircd.yaml`（明文 6667、无账号体系、带基本防洪；`listeners` 改 `0.0.0.0:6667` 即对外）：
+
+```yaml
+network:
+  name: OmpNet
+server:
+  name: localhost
+  listeners:
+    "127.0.0.1:6667":
+  ip-limits:
+    count: true
+    max-concurrent-connections: 32
+    throttle: true
+    window: 10m
+    max-connections-per-window: 128
+  check-ident: false
+accounts:
+  authentication-enabled: false
+  registration:
+    enabled: false
+channels:
+  default-modes: +nt
+datastore:
+  path: ircd.db
+  autoupgrade: true
+logging:
+  - method: stderr
+    type: "* -userinput -useroutput"
+    level: info
+```
+
+**共用的话务必做成服务**（别在 SSH 前台跑）：`/etc/systemd/system/ergo.service` 里 `ExecStart=/opt/ergo/ergo run --conf /opt/ergo/ircd.yaml`、`WorkingDirectory=/opt/ergo`、`Restart=always`，然后 `systemctl enable --now ergo`；日志用 `journalctl -u ergo -f`，升级只需替换 `/opt/ergo/ergo` 后 `systemctl restart ergo`。
 
 ## 测试
 

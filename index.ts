@@ -108,6 +108,14 @@ function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): IrcRuntime {
 		nick: config.nick,
 		password: config.password,
 		channels: config.channels,
+		// 心跳缺省关闭（0）：真实 ircd 会 PING 客户端并在无 PONG 时断开，需要时在 irc.json 里打开。
+		keepalive:
+			config.keepaliveSeconds > 0
+				? {
+						intervalMs: config.keepaliveSeconds * 1000,
+						timeoutMs: (config.keepaliveTimeoutSeconds ?? config.keepaliveSeconds) * 1000,
+					}
+				: undefined,
 		logger,
 		onPrivmsg: onInbound,
 		onNotice: onInbound,

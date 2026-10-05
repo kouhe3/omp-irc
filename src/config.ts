@@ -44,6 +44,10 @@ export interface IrcConfig {
 	password?: string;
 	/** 每个 peer 的 jsonl 转录落脚目录。 */
 	transcriptDir: string;
+	/** 心跳间隔（秒）：>0 启用（静默这么久就发 `PING`）；0 = 关闭（缺省）。 */
+	keepaliveSeconds: number;
+	/** 发出 `PING` 后多久没有任何入站行就判定连接已死（秒）；缺省 = `keepaliveSeconds`。 */
+	keepaliveTimeoutSeconds?: number;
 	configPath: string;
 	/** 能连 server 的前提：server + nick 齐备。 */
 	configured: boolean;
@@ -64,10 +68,14 @@ interface EnvOverrides {
 	channels?: string[];
 	password?: string;
 	transcriptDir?: string;
+	keepaliveSeconds?: number;
+	keepaliveTimeoutSeconds?: number;
 }
 
 const CONFIG_FILENAME = "irc.json";
 const MAX_PORT = 65_535;
+/** 心跳秒数上限（一天）：再大就没意义了，多半是写错。 */
+const MAX_SECONDS = 24 * 60 * 60;
 
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -84,6 +92,12 @@ function asBoolean(value: unknown): boolean | undefined {
 	const raw = asString(value)?.toLowerCase();
 	if (raw === undefined) return undefined;
 	return !(raw === "0" || raw === "false" || raw === "no" || raw === "off");
+}
+
+function asSeconds(value: unknown): number | undefined {
+	const raw = typeof value === "number" ? value : asString(value) === undefined ? undefined : Number(asString(value));
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > MAX_SECONDS) return undefined;
+	return raw;
 }
 
 /** 逗号分隔字符串（env）或数组（文件）都接受，返回频道列表。 */
@@ -107,6 +121,8 @@ interface ConfigFile {
 	channels?: unknown;
 	password?: unknown;
 	transcriptDir?: unknown;
+	keepaliveSeconds?: unknown;
+	keepaliveTimeoutSeconds?: unknown;
 }
 
 function readConfigFile(filePath: string, notes: string[]): ConfigFile {
@@ -155,6 +171,8 @@ function readEnv(env: Record<string, string | undefined>, notes: string[]): EnvO
 	take("channels", env.IRC_CHANNELS, parseChannels);
 	take("password", env.IRC_PASSWORD, asString as (v: string) => string | undefined);
 	take("transcriptDir", env.IRC_TRANSCRIPT_DIR, asString as (v: string) => string | undefined);
+	take("keepaliveSeconds", env.IRC_KEEPALIVE_SECONDS, asSeconds as (v: string) => number | undefined);
+	take("keepaliveTimeoutSeconds", env.IRC_KEEPALIVE_TIMEOUT_SECONDS, asSeconds as (v: string) => number | undefined);
 	return out;
 }
 
@@ -184,6 +202,8 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 	const nick = overrides.nick ?? asString(file.nick) ?? "omp";
 	const channels = overrides.channels ?? parseChannels(file.channels) ?? [];
 	const transcriptDir = overrides.transcriptDir ?? asString(file.transcriptDir) ?? path.join(agentDir, "irc-transcripts");
+	const keepaliveSeconds = overrides.keepaliveSeconds ?? asSeconds(file.keepaliveSeconds) ?? 0;
+	const keepaliveTimeoutSeconds = overrides.keepaliveTimeoutSeconds ?? asSeconds(file.keepaliveTimeoutSeconds);
 
 	const config: IrcConfig = {
 		server,
@@ -193,6 +213,8 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 		channels,
 		password: overrides.password ?? asString(file.password),
 		transcriptDir,
+		keepaliveSeconds,
+		keepaliveTimeoutSeconds,
 		configPath: configFile,
 		configured: Boolean(server),
 	};
@@ -204,6 +226,11 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 	}
 	if (config.channels.length > 0) notes.push(`启动即 JOIN：${config.channels.join("、")}`);
 	else notes.push("未配置频道：只收私聊（可用 /irc join #频道 加入）");
+	if (keepaliveSeconds > 0) {
+		notes.push(
+			`心跳：每 ${keepaliveSeconds}s 发 PING，${keepaliveTimeoutSeconds ?? keepaliveSeconds}s 内无任何入站则判死重连`,
+		);
+	}
 	if (config.password) notes.push("已配置连接密码（PASS；SASL 不支持）");
 
 	return { config, notes };

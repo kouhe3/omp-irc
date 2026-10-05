@@ -115,6 +115,12 @@ export interface IrcClientOptions {
 	socketFactory?: SocketFactory;
 	/** 指数退避：base * 2^attempts，上限 max（毫秒）。 */
 	reconnect?: { base?: number; max?: number };
+	/**
+	 * 心跳（缺省关闭）：静默 `intervalMs` 后主动 `PING :token`；若之后 `timeoutMs` 内仍
+	 * **没有任何入站行**（服务端的 PING、别人的 PRIVMSG 都算），就判定连接已死并主动断开，
+	 * 走既有的退避重连。`timeoutMs` 缺省 = `intervalMs`。
+	 */
+	keepalive?: { intervalMs: number; timeoutMs?: number };
 	timers?: IrcTimers;
 	onPrivmsg?(message: IrcInboundMessage): void;
 	onNotice?(message: IrcInboundMessage): void;
@@ -249,6 +255,14 @@ export class IrcClient {
 	#running = false;
 	#attempts = 0;
 	#reconnectTimer?: unknown;
+	#keepalive?: { intervalMs: number; timeoutMs: number };
+	/** 下一次发 PING 的定时器。 */
+	#keepaliveTimer?: unknown;
+	/** 本次 PING 的判死截止定时器（收到任何入站行即取消）。 */
+	#keepaliveDeadline?: unknown;
+	/** 已发出、尚未被任何入站行确认的 PING 时间；undefined = 没有未决心跳。 */
+	#pingSentAt?: number;
+	#pingSeq = 0;
 
 	constructor(options: IrcClientOptions) {
 		this.#host = options.host;
@@ -263,6 +277,11 @@ export class IrcClient {
 		this.#timers = options.timers ?? systemTimers;
 		this.#base = options.reconnect?.base ?? 500;
 		this.#max = options.reconnect?.max ?? 30_000;
+		const interval = options.keepalive?.intervalMs ?? 0;
+		this.#keepalive =
+			interval > 0
+				? { intervalMs: interval, timeoutMs: Math.max(1, options.keepalive?.timeoutMs ?? interval) }
+				: undefined;
 		for (const channel of options.channels ?? []) this.#desired.add(normalizeChannel(channel));
 		this.onPrivmsg = options.onPrivmsg;
 		this.onNotice = options.onNotice;
@@ -287,6 +306,7 @@ export class IrcClient {
 			this.#timers.clearTimeout(this.#reconnectTimer);
 			this.#reconnectTimer = undefined;
 		}
+		this.#clearKeepalive();
 		const socket = this.#socket;
 		this.#socket = undefined;
 		this.#buffer = "";
@@ -405,10 +425,65 @@ export class IrcClient {
 		this.#buffer = "";
 		this.#connected = false;
 		this.#registered = false;
+		this.#clearKeepalive();
 		if (!this.#running) return;
 		this.#logger?.warn("IRC 连接断开", { host: this.#host, port: this.#port, connected: wasConnected });
 		this.onDisconnect?.();
 		this.#scheduleReconnect();
+	}
+
+	/** 注册成功后开始心跳；`keepalive` 未配置时是 no-op。 */
+	#armKeepalive(): void {
+		this.#clearKeepalive();
+		const keepalive = this.#keepalive;
+		if (!keepalive || !this.#running) return;
+		this.#keepaliveTimer = this.#timers.setTimeout(() => this.#tickKeepalive(), keepalive.intervalMs);
+	}
+
+	#tickKeepalive(): void {
+		this.#keepaliveTimer = undefined;
+		const keepalive = this.#keepalive;
+		if (!keepalive || !this.#running || !this.#connected) return;
+		this.#pingSeq += 1;
+		this.#pingSentAt = Date.now();
+		this.send(`PING :omp-${this.#pingSeq}`);
+		this.#keepaliveDeadline = this.#timers.setTimeout(() => this.#onKeepaliveTimeout(), keepalive.timeoutMs);
+		this.#keepaliveTimer = this.#timers.setTimeout(() => this.#tickKeepalive(), keepalive.intervalMs);
+	}
+
+	/** PING 之后一直没有任何入站行：判定半开连接，主动断开并交给既有重连路径。 */
+	#onKeepaliveTimeout(): void {
+		this.#keepaliveDeadline = undefined;
+		const keepalive = this.#keepalive;
+		if (!keepalive || !this.#running || this.#pingSentAt === undefined) return;
+		this.#pingSentAt = undefined;
+		this.#logger?.warn("IRC 心跳超时，判定连接已死", {
+			host: this.#host,
+			port: this.#port,
+			timeoutMs: keepalive.timeoutMs,
+		});
+		// destroy → close → #onClose()：与断线同一条恢复路径（退避重连 + 重新 JOIN）。
+		this.#socket?.destroy();
+	}
+
+	/** 任何入站行都算活着：撤掉未决心跳与它的判死截止。 */
+	#noteInbound(): void {
+		this.#pingSentAt = undefined;
+		if (this.#keepaliveDeadline === undefined) return;
+		this.#timers.clearTimeout(this.#keepaliveDeadline);
+		this.#keepaliveDeadline = undefined;
+	}
+
+	#clearKeepalive(): void {
+		this.#pingSentAt = undefined;
+		if (this.#keepaliveTimer !== undefined) {
+			this.#timers.clearTimeout(this.#keepaliveTimer);
+			this.#keepaliveTimer = undefined;
+		}
+		if (this.#keepaliveDeadline !== undefined) {
+			this.#timers.clearTimeout(this.#keepaliveDeadline);
+			this.#keepaliveDeadline = undefined;
+		}
 	}
 
 	#scheduleReconnect(): void {
@@ -429,7 +504,11 @@ export class IrcClient {
 		while (index !== -1) {
 			const line = this.#buffer.slice(0, index).replace(/\r$/, "");
 			this.#buffer = this.#buffer.slice(index + 1);
-			if (line.trim()) this.#handle(line);
+			if (line.trim()) {
+				// 任何入站行（含服务端自己的 PING）都证明连接活着：撤掉未决心跳。
+				this.#noteInbound();
+				this.#handle(line);
+			}
 			index = this.#buffer.indexOf("\n");
 		}
 	}
@@ -448,6 +527,7 @@ export class IrcClient {
 				this.#registered = true;
 				this.#logger?.info("IRC 已注册", { nick: this.#nick });
 				this.onRegistered?.();
+				this.#armKeepalive();
 				// 重连后的重新 JOIN：desired 是留驻频道集合，这里一次性补上。
 				for (const channel of this.#desired) this.send(`JOIN ${channel}`);
 				// 断线期间排队的对话正文按序补发。

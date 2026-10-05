@@ -50,6 +50,8 @@ afterEach(async () => {
 /** 假 socket：把事件面暴露给测试、记录写出的原始行。 */
 class FakeSocket implements IrcSocket {
 	readonly writes: string[] = [];
+	/** destroy() 次数：心跳判死路径据此断言（真实 node 随后会发 close）。 */
+	destroyCalls = 0;
 	readonly #listeners = new Map<string, ((arg?: unknown) => void)[]>();
 
 	write(data: string): boolean {
@@ -59,7 +61,9 @@ class FakeSocket implements IrcSocket {
 
 	end(): void {}
 
-	destroy(): void {}
+	destroy(): void {
+		this.destroyCalls += 1;
+	}
 
 	on(event: "connect", listener: () => void): unknown;
 	on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
@@ -79,23 +83,26 @@ class FakeSocket implements IrcSocket {
 	}
 }
 
-/** 假定时器：只记录延迟，由测试手动触发下一个回调（退避序列因此是确定性的）。 */
+/** 假定时器：只记录延迟，由测试手动触发下一个回调（退避/心跳序列因此是确定性的）。 */
 class FakeTimers implements IrcTimers {
 	readonly delays: number[] = [];
-	readonly #pending: (() => void)[] = [];
+	/** 句柄就是排队项本身，`clearTimeout(handle)` 只摘掉它——心跳有「下一次」与「判死」两个并行定时器。 */
+	readonly #pending: { callback: () => void }[] = [];
 
 	setTimeout(callback: () => void, ms: number): unknown {
 		this.delays.push(ms);
-		this.#pending.push(callback);
-		return callback;
+		const entry = { callback };
+		this.#pending.push(entry);
+		return entry;
 	}
 
-	clearTimeout(): void {
-		this.#pending.length = 0;
+	clearTimeout(handle: unknown): void {
+		const index = this.#pending.indexOf(handle as { callback: () => void });
+		if (index !== -1) this.#pending.splice(index, 1);
 	}
 
 	runNext(): void {
-		this.#pending.shift()?.();
+		this.#pending.shift()?.callback();
 	}
 }
 
@@ -181,6 +188,79 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		client.stop();
 		socket.emit("close");
 		expect(timers.delays).toEqual([]);
+	});
+
+	test("keepalive 未配置时不发 PING、也不排任何定时器（缺省行为不变）", () => {
+		const socket = new FakeSocket();
+		const timers = new FakeTimers();
+		const client = new IrcClient({ host: "mock", port: 6667, nick: "omp", socketFactory: () => socket, timers });
+		clients.push(client);
+		client.start();
+		socket.emit("connect");
+		socket.emit("data", ":mock 001 omp :welcome\r\n");
+		expect(socket.writes.some(line => line.startsWith("PING "))).toBe(false);
+		expect(timers.delays).toEqual([]);
+	});
+
+	test("keepalive：静默 interval 后发 PING，任何入站行都撤销判死截止", () => {
+		const socket = new FakeSocket();
+		const timers = new FakeTimers();
+		const client = new IrcClient({
+			host: "mock",
+			port: 6667,
+			nick: "omp",
+			socketFactory: () => socket,
+			timers,
+			keepalive: { intervalMs: 1_000, timeoutMs: 400 },
+		});
+		clients.push(client);
+		client.start();
+		socket.emit("connect");
+		socket.emit("data", ":mock 001 omp :welcome\r\n");
+		// 注册后才排第一次心跳；之前不排。
+		expect(timers.delays).toEqual([1_000]);
+
+		timers.runNext(); // 心跳到点：发 PING，并排下「判死 400」与「下一次 1000」
+		expect(socket.writes).toContain("PING :omp-1\r\n");
+		expect(timers.delays.slice(1)).toEqual([400, 1_000]);
+
+		socket.emit("data", ":mock PONG mock :omp-1\r\n"); // 任何入站行都算活着
+		timers.runNext(); // 跑到下一次心跳（判死截止已被撤销，不会 destroy）
+		expect(socket.destroyCalls).toBe(0);
+		expect(socket.writes).toContain("PING :omp-2\r\n");
+	});
+
+	test("keepalive：PING 后超时没有任何入站 → 判死并走退避重连", () => {
+		const sockets: FakeSocket[] = [];
+		const timers = new FakeTimers();
+		const client = new IrcClient({
+			host: "mock",
+			port: 6667,
+			nick: "omp",
+			timers,
+			keepalive: { intervalMs: 1_000, timeoutMs: 300 },
+			reconnect: { base: 20, max: 20 },
+			socketFactory: () => {
+				const socket = new FakeSocket();
+				sockets.push(socket);
+				return socket;
+			},
+		});
+		clients.push(client);
+		client.start();
+		const first = sockets[0];
+		first?.emit("connect");
+		first?.emit("data", ":mock 001 omp :welcome\r\n");
+
+		timers.runNext(); // 心跳：发 PING + 排判死
+		expect(first?.writes).toContain("PING :omp-1\r\n");
+		timers.runNext(); // 判死截止到点，期间没有任何入站
+		expect(first?.destroyCalls).toBe(1);
+
+		first?.emit("close"); // 真实 node：destroy → close
+		expect(timers.delays.at(-1)).toBe(20);
+		timers.runNext();
+		expect(sockets).toHaveLength(2);
 	});
 });
 
