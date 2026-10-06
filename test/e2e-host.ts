@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { workspaceTag } from "../src/config";
 import { startMockIrcServer, type MockIrcServer } from "./mock-irc-server";
 
 const CHANNEL = process.env.IRC_E2E_CHANNEL ?? "#omp";
@@ -29,7 +30,10 @@ const [serverHost, serverPort] = EXTERNAL
 	? (EXTERNAL.split(":", 2) as [string, string])
 	: [mock?.host ?? "127.0.0.1", String(mock?.port ?? 0)];
 // 外部 ircd 上 `omp` 可能已被占用（撞名会被 433 改名，私聊就打偏了）：带随机后缀。
-const botNick = EXTERNAL ? `omp-e2e-${Date.now().toString(36).slice(-4)}` : "omp";
+const botNickBase = EXTERNAL ? `omp-e2e-${Date.now().toString(36).slice(-4)}` : "omp";
+// 宿主进程的 cwd 是 tmp，扩展默认给昵称加工作区后缀（实例专属昵称）：按同一规则算出期望值，
+// 于是这条断言等于在验「真宿主把 ctx.cwd 传给了扩展」——传丢了就会退化成 botNickBase 而 FAIL。
+const botNick = `${botNickBase}-${workspaceTag(tmp)}`;
 
 // 外部 ircd：裸 socket 当"人类"——先注册（等到 001 再 JOIN，很多 ircd 会先做 hostname 查询）。
 let human: net.Socket | undefined;
@@ -69,7 +73,10 @@ const host = spawn([...hostCommand, "--mode", "rpc"], {
 		IRC_SERVER: serverHost,
 		IRC_PORT: serverPort,
 		IRC_TLS: "false",
-		IRC_NICK: botNick,
+		// IRC_NICK 是**基础**昵称：期望的最终昵称是它 + `-` + 工作区标签（见 botNick）。
+		IRC_NICK: botNickBase,
+		// 钉住后缀模板：本测试的期望昵称按 {workspace} 算，别让机器上的 IRC_NICK_SUFFIX 影响结果。
+		IRC_NICK_SUFFIX: "{workspace}",
 		IRC_CHANNELS: CHANNEL,
 		IRC_TRANSCRIPT_DIR: transcriptDir,
 		IRC_KEEPALIVE_SECONDS: process.env.IRC_KEEPALIVE_SECONDS ?? "0",

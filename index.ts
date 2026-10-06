@@ -7,6 +7,9 @@
  * `/irc disconnect` / `/irc connect` 可随时在同一会话里换手（断开只停传输层，peer 与转录保留）；
  * 子会话（task/`/tan`）不重复连接——IRC 连接是进程级单例。
  *
+ * 昵称是**实例专属**的：最终昵称 = `nick` + `-` + 工作区标签（`ctx.cwd` 的目录名，`D:/JXAI` →
+ * `omp-jxai`），因此同一台机器上多个 omp 实例连同一个频道也能分辨（`nickSuffix` 可改模板或关闭）。
+ *
  * 配置见 README；最小可用：`<agentDir>/irc.json` 写 `{"server":"irc.example.org","nick":"omp"}`，
  * 或设 `IRC_SERVER` / `IRC_NICK`。不配也能加载：`/irc status` 会说明缺什么。
  */
@@ -51,7 +54,8 @@ function statusText(target: IrcRuntime): string {
 	if (!target.config.configured) return "IRC ⨯ 未配置";
 	const status = target.client.status();
 	if (!target.started) return "IRC ○ 未连接（/irc connect）";
-	if (status.registered) return `IRC ● 已连接（${target.peers.list().length} 会话）`;
+	// 带上自己的昵称：多个实例并排开着时，这一格是「我是哪个实例」的唯一线索。
+	if (status.registered) return `IRC ● ${status.nick}（${target.peers.list().length} 会话）`;
 	if (status.connected) return "IRC ◌ 注册中…";
 	return status.attempts > 0 ? `IRC ◌ 重连中（第 ${status.attempts} 次）` : "IRC ◌ 连接中…";
 }
@@ -68,6 +72,7 @@ function connectRuntime(target: IrcRuntime): void {
 		server: target.config.server,
 		port: target.config.port,
 		tls: target.config.tls,
+		nick: target.config.nick,
 	});
 	target.client.start();
 	updateStatus(target);
@@ -88,7 +93,8 @@ function disconnectRuntime(target: IrcRuntime): void {
 function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): IrcRuntime {
 	if (runtime) return runtime;
 	const notes: string[] = [];
-	const { config } = loadConfig(pi.pi.getAgentDir(), { notes });
+	// cwd 是昵称实例后缀（`{workspace}`）的来源：本机多实例据此得到不同的昵称。
+	const { config } = loadConfig(pi.pi.getAgentDir(), { notes, cwd: ctx.cwd });
 	const logger: IrcLogger = pi.logger;
 	// AgentRegistry 满足 PeerRegistry 的结构子集（get/register/unregister）；
 	// 类型层面两个模块无法互推，理由充分的断言集中在这一行。

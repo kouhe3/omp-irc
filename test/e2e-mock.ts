@@ -199,8 +199,13 @@ try {
 		}),
 		"utf8",
 	);
+	// 扩展自己调 loadConfig 时不传 env（index.ts），读的是**真实 process.env**：
+	// 先清掉机器上的 IRC_*，否则本机环境会盖掉 irc.json 与新增的昵称断言。
+	for (const key of Object.keys(process.env)) if (key.startsWith("IRC_")) delete process.env[key];
 	process.env.IRC_CONFIG_PATH = path.join(extRoot, "irc.json");
-	delete process.env.IRC_SERVER;
+	// 实例后缀默认打开：扩展拿 `ctx.cwd` 的工作区标签拼昵称（本机多实例据此可区分）。
+	const extWorkspace = path.join(root, "My Workspace");
+	const extNick = "ompext-my-workspace";
 
 	const statuses: (string | undefined)[] = [];
 	const notices: string[] = [];
@@ -230,6 +235,7 @@ try {
 	ircExtension(stubPi);
 	const extCtx = {
 		agent: { kind: "main" },
+		cwd: extWorkspace,
 		ui: {
 			setStatus: (_key: string, text: string | undefined) => statuses.push(text),
 			notify: (text: string) => notices.push(text),
@@ -241,14 +247,15 @@ try {
 	await handlers.get("session_start")?.({}, extCtx);
 	// 等到扩展自己的客户端注册完成（001 之后才会 JOIN）：NICK/USER 到达 ≠ 注册完成。
 	await server.waitForJoin("#ext");
+	check(server.nicks().includes(extNick), "昵称带上工作区后缀（ctx.cwd → 实例专属）", server.nicks().join(","));
 	check(
-		server.channelsOf("ompext").includes("#ext"),
+		server.channelsOf(extNick).includes("#ext"),
 		"按 irc.json 启动并 JOIN 了 #ext",
-		`channels=${server.channelsOf("ompext").join(",")} received=${server.received.slice(-6).join(" | ")}`,
+		`channels=${server.channelsOf(extNick).join(",")} received=${server.received.slice(-6).join(" | ")}`,
 	);
 	check(
-		statuses.some(text => text?.startsWith("IRC ● 已连接") === true),
-		"状态栏更新为已连接",
+		statuses.some(text => text?.startsWith(`IRC ● ${extNick}`) === true),
+		"状态栏更新为已连接（并带上自己的昵称）",
 		statuses.filter(Boolean).join(" → "),
 	);
 
@@ -258,7 +265,7 @@ try {
 	check(notices.at(-1)?.includes("irc.json") === true || notices.at(-1)?.includes("连接目标") === true, "/irc status 列出配置说明", notices.at(-1)?.slice(0, 60) ?? "");
 
 	const cardsBefore = cards.length;
-	peerbot.privmsg("ompext", "hi from peerbot");
+	peerbot.privmsg(extNick, "hi from peerbot");
 	await gate.until(
 		() => cards.length > cardsBefore && cards.at(-1)?.body === "[私聊] peerbot: hi from peerbot",
 		"扩展链路把入站投给主会话",
@@ -276,8 +283,8 @@ try {
 	await commandDefinition?.handler("disconnect", extCtx);
 	check(statuses.at(-1) === "IRC ○ 未连接（/irc connect）", "/irc disconnect 后状态栏变成未连接（带重连提示）", String(statuses.at(-1)));
 	check(notices.at(-1)?.includes("已断开 IRC") === true, "/irc disconnect 回报断开", notices.at(-1) ?? "");
-	await server.waitUntil(() => !server.nicks().includes("ompext"), "ompext 已从 server 掉线");
-	check(server.channelsOf("ompext").length === 0, "断开后不在任何频道里", server.channelsOf("ompext").join(","));
+	await server.waitUntil(() => !server.nicks().includes(extNick), `${extNick} 已从 server 掉线`);
+	check(server.channelsOf(extNick).length === 0, "断开后不在任何频道里", server.channelsOf(extNick).join(","));
 	await commandDefinition?.handler("status", extCtx);
 	check(
 		notices.at(-1)?.startsWith("IRC：未连接（/irc connect 可连接）") === true,
@@ -298,8 +305,8 @@ try {
 	check(statuses.at(-1) === "IRC ◌ 连接中…", "刚发起连接时状态栏是连接中（不是重连中）", String(statuses.at(-1)));
 	// onRegistered 先于 JOIN 发生（client 处理 001 → 刷状态 → 再发 JOIN），所以 server 看到 JOIN 时状态栏已更新。
 	await server.waitForJoin("#ext");
-	check(statuses.at(-1)?.startsWith("IRC ● 已连接") === true, "重连后状态栏回到已连接", String(statuses.at(-1)));
-	check(server.channelsOf("ompext").includes("#ext"), "重连后重新 JOIN 了 #ext", server.channelsOf("ompext").join(","));
+	check(statuses.at(-1)?.startsWith(`IRC ● ${extNick}`) === true, "重连后状态栏回到已连接", String(statuses.at(-1)));
+	check(server.channelsOf(extNick).includes("#ext"), "重连后重新 JOIN 了 #ext", server.channelsOf(extNick).join(","));
 	check(server.received.filter(line => line === "JOIN #ext").length > extJoinsBefore, "重新 JOIN 真的走了一遍");
 	check(
 		await server.waitForLine(/^PRIVMSG peerbot :queued while disconnected$/).catch(() => "") === "PRIVMSG peerbot :queued while disconnected",
@@ -320,6 +327,9 @@ try {
 		`${bare.config.port} ${bare.config.nick} tls=${bare.config.tls}`,
 	);
 	check(bare.notes.some(note => note.includes("未配置 server")), "notes 说明缺什么", bare.notes.join(" / "));
+	// 宿主传了 ctx.cwd 时（扩展的真实调用形态）昵称自动带实例后缀。
+	const bareWithCwd = loadConfig(bareDir, { env: {}, notes: [], cwd: extWorkspace });
+	check(bareWithCwd.config.nick === "omp-my-workspace", "loadConfig 用 cwd 推导实例后缀", bareWithCwd.config.nick);
 	// 未配置时没有连接：用「未连接」的客户端形状代表这种状态，连接控制面记下有没有被误调用。
 	const bareCalls: string[] = [];
 	const bareDeps = {

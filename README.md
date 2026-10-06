@@ -6,6 +6,7 @@ agent 对等通话：
 - **入站**：IRC 私聊/频道消息 → 主会话的 `irc:incoming` 卡片（与 peer 之间的 IRC 消息同一条路径）。
 - **出站**：IRC 会话注册成 omp 的 peer 替身，模型直接 `write agent://irc-<nick>` 回话。
 - **转录**：每个会话一份宿主格式的 jsonl，Agent Hub 里 `⏎` 打开转录（`transcriptOnly: true`），`history://<peer>` 也读它。
+- **实例专属昵称**：昵称默认带工作区后缀（`D:/JXAI` → `omp-jxai`），本机多个 omp 实例连同一频道也分得清。
 
 设计与 QQ 扩展（`tencent_qq_bot`）同构：peer 注册面、替身会话、转录格式、bridge 入站注入
 全部照搬同一套契约，只有传输层换成了本扩展自己的 IRC 客户端。
@@ -33,6 +34,7 @@ bun run test/e2e-mock.ts    # 端到端（真 TCP + mock server + 真实扩展�
 	"port": 6697,
 	"tls": true,
 	"nick": "omp",
+	"nickSuffix": "{workspace}",
 	"channels": ["#agents", "#dev"],
 	"password": "server-password",
 	"transcriptDir": "/path/to/transcripts"
@@ -44,7 +46,8 @@ bun run test/e2e-mock.ts    # 端到端（真 TCP + mock server + 真实扩展�
 | `server` | 无（必填才算配好） | IRC server 主机名/IP |
 | `port` | `6667`（明文）/ `6697`（TLS） | 端口 |
 | `tls` | `false` | 走 `tls.connect`，按系统 CA 校验 |
-| `nick` | `"omp"` | 昵称；被占用会自动加 `_` 重试（433） |
+| `nick` | `"omp"` | **基础**昵称；最终昵称 = `nick` + `-` + 展开后的 `nickSuffix`（见下） |
+| `nickSuffix` | `"{workspace}"` | **实例后缀**模板：`{workspace}` → 工作区目录名（`ctx.cwd` 的 basename），`{hash}` → 工作区路径的 4 位短哈希；置 `""`/`false`/`"off"` 关闭 |
 | `channels` | `[]` | 启动即 JOIN 的频道；空则只收私聊 |
 | `password` | 无 | **连接密码**（IRC `PASS`），不是 SASL |
 | `transcriptDir` | `<agentDir>/irc-transcripts` | 每个 peer 的 jsonl 转录目录 |
@@ -53,9 +56,29 @@ bun run test/e2e-mock.ts    # 端到端（真 TCP + mock server + 真实扩展�
 
 同名环境变量可覆盖（优先级高于文件，逐条日志会说明哪个生效）：
 
-`IRC_SERVER`、`IRC_PORT`、`IRC_TLS`、`IRC_NICK`、`IRC_CHANNELS`（逗号分隔）、
+`IRC_SERVER`、`IRC_PORT`、`IRC_TLS`、`IRC_NICK`、`IRC_NICK_SUFFIX`、`IRC_CHANNELS`（逗号分隔）、
 `IRC_PASSWORD`、`IRC_TRANSCRIPT_DIR`、`IRC_KEEPALIVE_SECONDS`、`IRC_KEEPALIVE_TIMEOUT_SECONDS`、
 `IRC_CONFIG_PATH`（改配置文件位置，测试/多实例隔离用）。
+
+### 多实例：实例专属昵称
+
+QQ 渠道是单例，IRC 不是：**同一台机器上的每个 omp 进程都是一条独立连接**。所以昵称默认带
+实例后缀——最终昵称 = `nick` + `-` + 工作区标签：
+
+| 工作区（`ctx.cwd`） | 昵称 |
+| --- | --- |
+| `D:/JXAI` | `omp-jxai` |
+| `C:/Users/K/proj/My App` | `omp-my-app` |
+| `D:/项目`（目录名收敛后为空） | `omp-<4 位短哈希>` |
+
+于是多个实例进同一个频道时互相可分，也不会抢同一个昵称。要更保险（不同父路径下同名目录）用
+`"nickSuffix": "{workspace}-{hash}"`；要钉死一个昵称（例如接外部 ircd 的机器人账号）用
+`"nickSuffix": ""`（env 里用 `IRC_NICK_SUFFIX=off`，空串同样算关闭）——此时多实例同名，
+撞名的那一个会被服务端改名加 `_`（433 自愈）。
+昵称总长按 30 字符截断（后缀至少留 4 字符，放不下就不加）。
+
+`/irc status` 与 `irc status` 都显示最终昵称，状态栏连上后也显示它（`IRC ● omp-jxai（2 会话）`），
+多个实例并排开着时一眼看出哪个窗口是哪个实例。
 
 ## 用法
 
@@ -89,7 +112,7 @@ peer id 规则：
 频道里的入站消息在卡片里带频道名（`[#omp] alice: 你好`），私聊是 `[私聊] alice: 你好`。
 
 连接由**主会话**持有（进程级单例，子会话不重复连）。状态栏那一格一眼看出当前状态：
-`IRC ● 已连接（N 会话）` / `IRC ◌ 连接中…` / `IRC ◌ 注册中…` / `IRC ◌ 重连中（第 N 次）` /
+`IRC ● omp-jxai（N 会话）` / `IRC ◌ 连接中…` / `IRC ◌ 注册中…` / `IRC ◌ 重连中（第 N 次）` /
 `IRC ○ 未连接（/irc connect）` / `IRC ⨯ 未配置`。要换手就在目标会话里 `/irc disconnect`，
 再在另一个会话里 `/irc connect`——`peers` 是进程内的登记表，换掉的是传输层，不是会话上下文。
 
@@ -117,7 +140,8 @@ peer id 规则：
 
 - **SASL 认证**（`AUTHENTICATE`）；需要认证的网络请用 `password`（连接密码）或网关。
 - IRCv3 扩展能力：`CAP` 协商、`message-tags`、`account-tag`、`chathistory`、`batch`、`echo-message` 等。
-- 多网络并行：只连一个 `server`（要接多个网络就起多份配置不同的 omp 实例，用 `IRC_CONFIG_PATH` 隔离）。
+- 多网络并行：只连一个 `server`（要接多个网络就起多份配置不同的 omp 实例，用 `IRC_CONFIG_PATH` 隔离；
+  同一 server 上的多实例靠默认打开的实例后缀区分昵称）。
 - 昵称注册（NickServ）、频道钥匙（`+k`）、CTCP 应答（CTCP 消息直接忽略，不进模型上下文）。
 - 服务端主机名发来的 `NOTICE`（注册期的 `*** Looking up your hostname` 之类）会被过滤，不进模型上下文。
 
@@ -156,6 +180,7 @@ peer id 规则：
 | 状态栏 `IRC ○ 未连接（/irc connect）` | 有人执行过 `/irc disconnect`（或本次会话还没连接）：`/irc connect` 重连 |
 | 状态栏 `IRC ◌ 重连中（第 N 次）` | server 不可达/被断开，客户端在指数退避重连；日志里有目标与延迟 |
 | 昵称被占用 | 自动加 `_` 重试；`/irc status` 显示最终昵称 |
+| 两个实例昵称一样（如 `omp-jxai` 与 `omp-jxai_`） | 同一个工作区（或不同父路径下的同名目录）里的实例：后者是 433 自愈的结果。用 `"nickSuffix": "{workspace}-{hash}"` 或 `"nickSuffix": ""` 加显式 `nick` 钉住 |
 | 收不到频道消息 | 确认 `channels` 配了或 `/irc join` 过；频道消息只发给频道成员 |
 | 模型看不到消息 | 主会话未注册（headless/未启动）时入站只落转录并 warn 日志 |
 | 长消息看不全 | 主会话卡片正文有上限；用 `/irc log <peer>` 或 Hub 里 `⏎` 看转录 |
@@ -219,6 +244,8 @@ logging:
 - `test/transcript.test.ts`：转录格式、原文不截断、滚动窗口、尾部读取、显示前净化。
 - `test/commands.test.ts`：`/irc connect|disconnect` 的决策与文案（未配置时不碰客户端、已在连接不重复 start、
   断开后 `status` 给出重连入口）、以及 `status` 的连接状态机（未连接 / 连接中 / 重连中 / 已注册）。
+- `test/config.test.ts`：实例专属昵称的推导（工作区标签收敛与哈希退化、`nickSuffix` 模板/关闭/长度上限、
+  env 覆盖、notes 文案）。
 - `test/e2e-mock.ts`：两个真实 `IrcClient` 互相对话（含真实扩展入口 `index.ts` 的装配冒烟，
   以及 `/irc disconnect` → 排队不上线 → `/irc connect` 重新 JOIN 并补发的往返）。
 - `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock IRC server，证明扩展在真宿主里 JOIN 后，入站频道/私聊消息落进 peer 转录（Hub `⏎` 与 `history://` 读的那份）。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。

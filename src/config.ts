@@ -7,6 +7,7 @@
  * 只支持一个 server（多网络并行不在 v1 范围，见 README）；SASL 不做，`password` 只是
  * 连接密码（IRC `PASS`，配给需要 server password 的私网/网关）。
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 
@@ -36,7 +37,7 @@ export interface IrcConfig {
 	port: number;
 	/** 是否 TLS（`tls.connect`，默认按系统 CA 校验）。 */
 	tls: boolean;
-	/** 昵称；也是私聊 peer 的目标名。 */
+	/** 连接用的最终昵称 = `nick` + `-` + 展开后的实例后缀；也是私聊 peer 的目标名。 */
 	nick: string;
 	/** 启动即 JOIN 的频道（缺省为空：只收私聊）。 */
 	channels: string[];
@@ -65,6 +66,7 @@ interface EnvOverrides {
 	port?: number;
 	tls?: boolean;
 	nick?: string;
+	nickSuffix?: string;
 	channels?: string[];
 	password?: string;
 	transcriptDir?: string;
@@ -113,11 +115,75 @@ function parseChannels(value: unknown): string[] | undefined {
 		.filter(Boolean);
 }
 
+/**
+ * 工作区标签 / 实例后缀。
+ *
+ * QQ 渠道是单例，IRC 不是：**同一个 IRC server 上，本机的每个 omp 实例都是一条独立连接**。
+ * 因此最终昵称默认带上工作区标签（`ctx.cwd` 的目录名）——`D:/JXAI` → `omp-jxai`，
+ * 同一频道里的多个实例一眼可分，也不会互相抢昵称。`nickSuffix` 可换模板或置空关闭。
+ */
+
+/** 昵称总长度上限（RFC2812 要求服务端至少支持 30 字符）。 */
+export const NICK_MAX_LENGTH = 30;
+/** 工作区标签长度上限：够区分，又不至于把昵称顶到服务端上限。 */
+const WORKSPACE_TAG_MAX = 16;
+/** 后缀模板的缺省值：工作区目录名。 */
+const DEFAULT_NICK_SUFFIX = "{workspace}";
+/** 声明「关闭实例后缀」的写法（文件里也可以直接用布尔 `false`）。 */
+const NICK_SUFFIX_OFF: Record<string, true> = { "": true, "0": true, false: true, no: true, off: true, none: true, "-": true };
+
+/** 收敛成 IRC 昵称里最保守的一档字符集（`[a-z0-9_-]`），并去掉首尾的 `-`/`_`。 */
+function sanitizeNickPart(raw: string, limit: number): string {
+	const collapsed = raw
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^[-_]+|[-_]+$/g, "");
+	return collapsed.slice(0, Math.max(0, limit));
+}
+
+/** 工作区路径的 4 位短哈希：目录同名（不同父路径）时还能区分。 */
+export function shortPathHash(cwd: string): string {
+	return createHash("sha256").update(cwd).digest("hex").slice(0, 4);
+}
+
+/**
+ * 工作区的昵称标签：`D:/JXAI` → `jxai`。目录名收敛后为空（全非 ASCII 的目录名、盘根）
+ * 时退化为 4 位短哈希，保证非空；没有工作区路径时为 `""`（= 不加后缀）。
+ */
+export function workspaceTag(cwd: string | undefined): string {
+	if (!cwd) return "";
+	const tag = sanitizeNickPart(path.basename(path.resolve(cwd)), WORKSPACE_TAG_MAX);
+	return tag || shortPathHash(cwd);
+}
+
+/** 展开 `nickSuffix` 模板：`{workspace}` → 工作区标签，`{hash}` → 4 位短哈希。 */
+export function expandNickSuffix(template: string, cwd: string | undefined): string {
+	if (!cwd) return "";
+	const tag = workspaceTag(cwd);
+	const expanded = template.replaceAll("{workspace}", tag).replaceAll("{hash}", shortPathHash(cwd));
+	return sanitizeNickPart(expanded, NICK_MAX_LENGTH);
+}
+
+/**
+ * `nickSuffix` 取值：字符串按模板处理，空串与 `false`/`off` 类写法 = 关闭（返回空串）；
+ * 其它类型（`true`、数字…）视为没写，回退默认模板。
+ * **注意**空串在这里有语义（关闭），所以不能用 {@link asString} 判空。
+ */
+function parseNickSuffix(value: unknown): string | undefined {
+	if (typeof value === "string") {
+		const raw = value.trim();
+		return NICK_SUFFIX_OFF[raw.toLowerCase()] ? "" : raw;
+	}
+	return value === false ? "" : undefined;
+}
+
 interface ConfigFile {
 	server?: unknown;
 	port?: unknown;
 	tls?: unknown;
 	nick?: unknown;
+	nickSuffix?: unknown;
 	channels?: unknown;
 	password?: unknown;
 	transcriptDir?: unknown;
@@ -173,6 +239,15 @@ function readEnv(env: Record<string, string | undefined>, notes: string[]): EnvO
 	take("transcriptDir", env.IRC_TRANSCRIPT_DIR, asString as (v: string) => string | undefined);
 	take("keepaliveSeconds", env.IRC_KEEPALIVE_SECONDS, asSeconds as (v: string) => number | undefined);
 	take("keepaliveTimeoutSeconds", env.IRC_KEEPALIVE_TIMEOUT_SECONDS, asSeconds as (v: string) => number | undefined);
+	// 不走 take：空串对 nickSuffix 有语义（关闭后缀），而 take 把空串当「未设置」跳过。
+	if (env.IRC_NICK_SUFFIX !== undefined) {
+		const parsed = parseNickSuffix(env.IRC_NICK_SUFFIX);
+		if (parsed === undefined) notes.push(`env ${envName("nickSuffix")} 值非法，已忽略`);
+		else {
+			out.nickSuffix = parsed;
+			notes.push(`env ${envName("nickSuffix")} 生效`);
+		}
+	}
 	return out;
 }
 
@@ -183,6 +258,11 @@ function envName(key: keyof EnvOverrides): string {
 
 export interface IrcConfigOptions {
 	env?: Record<string, string | undefined>;
+	/**
+	 * 会话工作区（宿主 `ctx.cwd`）：实例后缀 `{workspace}` / `{hash}` 的来源。
+	 * 不传（直连 loadConfig 的测试/嵌入场景）时不加实例后缀，昵称就是 `nick`。
+	 */
+	cwd?: string;
 	/** 追加说明的输出，便于测试断言。 */
 	notes?: string[];
 }
@@ -190,6 +270,7 @@ export interface IrcConfigOptions {
 export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): IrcConfigLoad {
 	const notes = options.notes ?? [];
 	const env = options.env ?? (process.env as Record<string, string | undefined>);
+	const cwd = options.cwd;
 	// 配置文件位置可被 `IRC_CONFIG_PATH` 改写：跑测试/第二份实例时与机器上真实的 irc.json 隔离
 	// （指向一个不存在的路径 = 全默认）。
 	const configFile = asString(env.IRC_CONFIG_PATH) ?? path.join(agentDir, CONFIG_FILENAME);
@@ -199,7 +280,12 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 	const server = overrides.server ?? asString(file.server);
 	const tls = overrides.tls ?? asBoolean(file.tls) ?? false;
 	const port = overrides.port ?? asPort(file.port) ?? (tls ? 6697 : 6667);
-	const nick = overrides.nick ?? asString(file.nick) ?? "omp";
+	const baseNick = overrides.nick ?? asString(file.nick) ?? "omp";
+	const nickSuffixTemplate = overrides.nickSuffix ?? parseNickSuffix(file.nickSuffix) ?? DEFAULT_NICK_SUFFIX;
+	// 昵称总长有上限：后缀留给 `-` + 至少 4 个字符，否则不如不加（加一两个字符也区分不了实例）。
+	const suffixRoom = NICK_MAX_LENGTH - baseNick.length - 1;
+	const nickSuffix = suffixRoom >= 4 ? expandNickSuffix(nickSuffixTemplate, cwd).slice(0, suffixRoom) : "";
+	const nick = nickSuffix ? `${baseNick}-${nickSuffix}` : baseNick;
 	const channels = overrides.channels ?? parseChannels(file.channels) ?? [];
 	const transcriptDir = overrides.transcriptDir ?? asString(file.transcriptDir) ?? path.join(agentDir, "irc-transcripts");
 	const keepaliveSeconds = overrides.keepaliveSeconds ?? asSeconds(file.keepaliveSeconds) ?? 0;
@@ -223,6 +309,19 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 		notes.push(`未配置 server：写入 ${config.configPath}（{"server":"irc.example.org","nick":"omp"}）或设置 IRC_SERVER`);
 	} else {
 		notes.push(`连接目标：${config.server}:${config.port}${config.tls ? "（TLS）" : "（明文）"}，昵称 ${config.nick}`);
+	}
+	if (nickSuffixTemplate === "") {
+		notes.push('实例后缀已关闭（nickSuffix=""）：同一 server 上多个实例会同名，撞名时服务端改名加 "_"');
+	} else if (nickSuffix) {
+		notes.push(
+			`实例后缀 ${nickSuffixTemplate} → -${nickSuffix}（本机多实例/多工作区据此区分昵称；nickSuffix 置 "" 或 off 可关闭）`,
+		);
+	} else if (!cwd) {
+		notes.push("实例后缀未生效（未提供工作区路径）");
+	} else if (suffixRoom < 4) {
+		notes.push(`实例后缀未生效（昵称 ${baseNick} 已占满 ${NICK_MAX_LENGTH} 字符）`);
+	} else {
+		notes.push(`实例后缀未生效（${nickSuffixTemplate} 展开后不含合法昵称字符）`);
 	}
 	if (config.channels.length > 0) notes.push(`启动即 JOIN：${config.channels.join("、")}`);
 	else notes.push("未配置频道：只收私聊（可用 /irc join #频道 加入）");
