@@ -83,26 +83,45 @@ class FakeSocket implements IrcSocket {
 	}
 }
 
-/** 假定时器：只记录延迟，由测试手动触发下一个回调（退避/心跳序列因此是确定性的）。 */
+/** 假定时器的排队项：句柄本身就是它（`clearTimeout(handle)` 直接摘掉）。 */
+interface FakeTimerHandle {
+	callback: () => void;
+	due: number;
+}
+
+/**
+ * 假定时器：只记录延迟，由测试手动触发下一个回调（退避/心跳序列因此是确定性的）。
+ * 「下一个」按 **到期时间** 取（同刻按入队顺序，与 node timers 一致）——心跳有「下一次」与
+ * 「判死」两个并行定时器，延迟不同，谁先到点必须如实复现，否则测不出时间维度的错。
+ */
 class FakeTimers implements IrcTimers {
 	readonly delays: number[] = [];
 	/** 句柄就是排队项本身，`clearTimeout(handle)` 只摘掉它——心跳有「下一次」与「判死」两个并行定时器。 */
-	readonly #pending: { callback: () => void }[] = [];
+	readonly #pending: FakeTimerHandle[] = [];
+	/** 假时钟：前进到被触发定时器的到期时刻，嵌套的 setTimeout 因此有正确的基准。 */
+	#now = 0;
 
 	setTimeout(callback: () => void, ms: number): unknown {
 		this.delays.push(ms);
-		const entry = { callback };
+		const entry = { callback, due: this.#now + ms };
 		this.#pending.push(entry);
 		return entry;
 	}
 
 	clearTimeout(handle: unknown): void {
-		const index = this.#pending.indexOf(handle as { callback: () => void });
+		const index = this.#pending.indexOf(handle as FakeTimerHandle);
 		if (index !== -1) this.#pending.splice(index, 1);
 	}
 
 	runNext(): void {
-		this.#pending.shift()?.callback();
+		let next = 0;
+		for (let index = 1; index < this.#pending.length; index++) {
+			if ((this.#pending[index]?.due ?? 0) < (this.#pending[next]?.due ?? 0)) next = index;
+		}
+		const [entry] = this.#pending.splice(next, 1);
+		if (!entry) return;
+		this.#now = entry.due;
+		entry.callback();
 	}
 }
 
@@ -261,6 +280,51 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		expect(timers.delays.at(-1)).toBe(20);
 		timers.runNext();
 		expect(sockets).toHaveLength(2);
+	});
+
+	test("keepalive：timeout > interval 时，历史判死截止不会误杀活连接", () => {
+		// interval(1000) < timeout(3000)：每个心跳都会到点一次，判死截止必须「一次静默只留一个」。
+		// 回归：旧实现每个心跳都直接覆盖句柄（不 clearTimeout），入站只撤销「最新」那个，
+		// 更早的句柄带着「PING 后一直没入站」的语义在 t=4000 触发，把活连接判死。
+		const socket = new FakeSocket();
+		const timers = new FakeTimers();
+		const client = new IrcClient({
+			host: "mock",
+			port: 6667,
+			nick: "omp",
+			socketFactory: () => socket,
+			timers,
+			keepalive: { intervalMs: 1_000, timeoutMs: 3_000 },
+		});
+		clients.push(client);
+		client.start();
+		socket.emit("connect");
+		socket.emit("data", ":mock 001 omp :welcome\r\n");
+
+		timers.runNext(); // t=1000 心跳 1：PING + 判死截止(3000) + 下一拍(1000)
+		timers.runNext(); // t=2000 心跳 2：截止还没到点，不该（在被入站撤销前）再排一个
+		socket.emit("data", ":mock PONG mock :omp-2\r\n"); // 入站：撤销「当前」那个截止
+		timers.runNext(); // t=3000 心跳 3：重新排一个判死截止
+		timers.runNext(); // t=4000 心跳 4：旧实现泄漏的截止也在这一刻到点
+
+		// 最后一次入站（t≈2000）与最后一次心跳（t=4000）都远没到 timeout 的静默口径。
+		expect(socket.destroyCalls).toBe(0);
+		expect(socket.writes).toContain("PING :omp-3\r\n");
+	});
+
+	test("TCP 已连上但还没注册（001 前）的正文也排队，注册后补发", () => {
+		// 回归：旧实现以「TCP 连上」（connect 事件）为排队界，握手窗口里直接写 PRIVMSG，
+		// 服务端还没认这个客户端 → 451 丢掉；每次重连都会经过这个窗口。
+		const socket = new FakeSocket();
+		const client = new IrcClient({ host: "mock", port: 6667, nick: "omp", socketFactory: () => socket });
+		clients.push(client);
+		client.start();
+		socket.emit("connect"); // NICK/USER 已发出，但服务端还没回 001
+		client.privmsg("alice", "before 001");
+		expect(socket.writes.filter(line => line.startsWith("PRIVMSG"))).toEqual([]);
+
+		socket.emit("data", ":mock 001 omp :welcome\r\n");
+		expect(socket.writes).toContain("PRIVMSG alice :before 001\r\n");
 	});
 });
 

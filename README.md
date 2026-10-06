@@ -51,7 +51,7 @@ bun run test/e2e-mock.ts    # 端到端（真 TCP + mock server + 真实扩展�
 | `channels` | `[]` | 启动即 JOIN 的频道；空则只收私聊 |
 | `password` | 无 | **连接密码**（IRC `PASS`），不是 SASL |
 | `transcriptDir` | `<agentDir>/irc-transcripts` | 每个 peer 的 jsonl 转录目录 |
-| `keepaliveSeconds` | `0`（关闭） | 心跳：静默这么久就主动 `PING :token`。真实 ircd 上的半开连接（看着在线、实际已死）靠它发现 |
+| `keepaliveSeconds` | `0`（关闭） | 心跳：每这么久主动发一次 `PING :token`。真实 ircd 上的半开连接（看着在线、实际已死）靠它发现 |
 | `keepaliveTimeoutSeconds` | = `keepaliveSeconds` | 发出 `PING` 后这么久内**没有任何入站行**（服务端 PING、别人的消息都算）就判死：断开并走既有退避重连 |
 
 同名环境变量可覆盖（优先级高于文件，逐条日志会说明哪个生效）：

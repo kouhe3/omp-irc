@@ -116,9 +116,9 @@ export interface IrcClientOptions {
 	/** 指数退避：base * 2^attempts，上限 max（毫秒）。 */
 	reconnect?: { base?: number; max?: number };
 	/**
-	 * 心跳（缺省关闭）：静默 `intervalMs` 后主动 `PING :token`；若之后 `timeoutMs` 内仍
-	 * **没有任何入站行**（服务端的 PING、别人的 PRIVMSG 都算），就判定连接已死并主动断开，
-	 * 走既有的退避重连。`timeoutMs` 缺省 = `intervalMs`。
+	 * 心跳（缺省关闭）：每隔 `intervalMs` 主动 `PING :token`；若某个 PING 之后 `timeoutMs`
+	 * 内仍 **没有任何入站行**（服务端的 PING、别人的 PRIVMSG 都算），就判定连接已死并主动
+	 * 断开，走既有的退避重连。`timeoutMs` 缺省 = `intervalMs`。
 	 */
 	keepalive?: { intervalMs: number; timeoutMs?: number };
 	timers?: IrcTimers;
@@ -373,9 +373,11 @@ export class IrcClient {
 		}
 	}
 
-	/** 对话正文的出站：没连上就排队（有界），等注册成功一起补发。 */
+	/** 对话正文的出站：还没注册就排队（有界），001 之后按序补发。 */
 	#out(line: string): void {
-		if (this.#connected) {
+		// 以「注册完成」而不是「TCP 连上」为界：握手窗口（连上 → 001）里服务端还没认这个
+		// 客户端，此刻直接写 PRIVMSG 只会被 451 丢掉；每次重连都要经过这个窗口。
+		if (this.#registered) {
 			this.send(line);
 			return;
 		}
@@ -447,7 +449,12 @@ export class IrcClient {
 		this.#pingSeq += 1;
 		this.#pingSentAt = Date.now();
 		this.send(`PING :omp-${this.#pingSeq}`);
-		this.#keepaliveDeadline = this.#timers.setTimeout(() => this.#onKeepaliveTimeout(), keepalive.timeoutMs);
+		// 一次静默只留一个判死截止：已经有（上一次 PING 之后没被入站撤销的）就不再排。
+		// 每次心跳都重排会覆盖句柄而不 clearTimeout，旧句柄既泄漏又带着「PING 之后一直没入站」
+		// 的语义在更晚的时刻触发——入站流量只撤销了「最新」那个句柄，连接就会被误判为死。
+		if (this.#keepaliveDeadline === undefined) {
+			this.#keepaliveDeadline = this.#timers.setTimeout(() => this.#onKeepaliveTimeout(), keepalive.timeoutMs);
+		}
 		this.#keepaliveTimer = this.#timers.setTimeout(() => this.#tickKeepalive(), keepalive.intervalMs);
 	}
 

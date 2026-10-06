@@ -11,7 +11,7 @@
 import type { IrcLogger } from "./config";
 import type { IrcInboundMessage } from "./client";
 import type { PeerDirectory, PeerRegistry, PeerScope } from "./peers";
-import type { TranscriptEntry } from "./transcript";
+import { stripControl, type TranscriptEntry } from "./transcript";
 
 /** 宿主 AgentSession 上我们用到的面。 */
 interface IrcDeliverySession {
@@ -77,7 +77,11 @@ export function createHostSink(options: HostSinkOptions): (delivery: InboundDeli
 	};
 }
 
-/** 入站正文的统一渲染：`[#omp] alice: hi` / `[私聊] alice: hi`（NOTICE 标出来）。 */
+/**
+ * 入站正文的统一渲染：`[#omp] alice: hi` / `[私聊] alice: hi`（NOTICE 标出来）。
+ * 整串过 {@link stripControl}：nick 与正文都是 IRC 来的不可信输入，而这张卡片（含模型侧上下文）
+ * 是扩展自己渲染给人看的；对端不该能靠 ESC/OSC 序列操纵运维者的终端。转录里仍是原文。
+ */
 export function formatInboundBody(event: {
 	scope: PeerScope;
 	targetId: string;
@@ -87,7 +91,7 @@ export function formatInboundBody(event: {
 }): string {
 	const where = event.scope === "channel" ? event.targetId : "私聊";
 	const kind = event.notice ? "NOTICE " : "";
-	return `[${kind}${where}] ${event.senderNick}: ${event.content}`;
+	return stripControl(`[${kind}${where}] ${event.senderNick}: ${event.content}`);
 }
 
 export interface InboundPipelineOptions {

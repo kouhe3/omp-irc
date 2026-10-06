@@ -296,6 +296,18 @@ describe("入站/出站（mock IRC server，真 TCP）", () => {
 		expect(stack.delivered.map(delivery => delivery.body)).toEqual(["[私聊] Alice: hi", "[NOTICE 私聊] Carol: psst"]);
 	});
 
+	test("入站卡片过 stripControl（对端不能用 ESC/OSC 操纵终端），转录仍存原文", async () => {
+		const stack = await buildStack();
+		const evil = "\u001b]52;c;cHduZWQ=\u0007伪造\u001b[2J行";
+		stack.server.simulatePrivmsg("Alice", "omp", evil);
+		await stack.gate.until(() => stack.delivered.length >= 1, "主会话收到入站投递");
+
+		expect(stack.delivered[0]?.body).toBe("[私聊] Alice: 伪造行");
+		expect(stack.delivered[0]?.body.includes("\u001b")).toBe(false);
+		// 转录是数据源（/irc log 之后再净化渲染），落盘保留原文。
+		expect(stack.transcripts.tail("irc-alice", 1)[0]?.text).toBe(`Alice: ${evil}`);
+	});
+
 	test("出站：peer 替身 deliverIrcMessage → server 收到 PRIVMSG <target> :<text>", async () => {
 		const stack = await buildStack();
 		stack.server.simulatePrivmsg("Alice", "omp", "在吗");
