@@ -78,6 +78,8 @@ peer id 规则：
 | 用法 | 作用 |
 | --- | --- |
 | `/irc status`（或 `irc status`） | 连接/注册/留驻频道/已登记 peer + 配置说明 |
+| `/irc connect` | 连接 IRC server（主会话 `session_start` 已自动连；断开后用这条重连） |
+| `/irc disconnect` | 断开并停止自动重连。只停传输层：peer 登记与转录保留，`/irc connect` 回来即可继续 |
 | `/irc list`（或 `irc list`） | 已知会话（id / 别名 / 最近活跃） |
 | `/irc log <peer> [条数]`（或 `irc log`） | 最近的**完整**消息记录（主会话卡片正文会被截断，长文看这里） |
 | `/irc say <peer> <正文>`（或 `irc say`） | 主动发一条 PRIVMSG；引用支持 peer id / nick / 频道 / 别名。**还没聊过的 nick 会当场登记**，不必等对方先开口 |
@@ -85,6 +87,18 @@ peer id 规则：
 | `/irc part <#频道>` | PART 并取消留驻 |
 
 频道里的入站消息在卡片里带频道名（`[#omp] alice: 你好`），私聊是 `[私聊] alice: 你好`。
+
+连接由**主会话**持有（进程级单例，子会话不重复连）。状态栏那一格一眼看出当前状态：
+`IRC ● 已连接（N 会话）` / `IRC ◌ 连接中…` / `IRC ◌ 注册中…` / `IRC ◌ 重连中（第 N 次）` /
+`IRC ○ 未连接（/irc connect）` / `IRC ⨯ 未配置`。要换手就在目标会话里 `/irc disconnect`，
+再在另一个会话里 `/irc connect`——`peers` 是进程内的登记表，换掉的是传输层，不是会话上下文。
+
+`/irc disconnect` 之后：
+
+- 不接收入站（server 侧连接已断），状态栏变 `○ 未连接（/irc connect）`；
+- 已登记的 peer 与转录**照旧**，`/irc log`、Hub 转录视图都还能看；
+- 这段时间里 `write agent://<peer>` / 工具发的内容会**排队**（最多 64 条），`/irc connect` 注册成功后按序补发；
+  想在断开期间就让发送失败（而不是排队），先在模型侧别发——`/irc say` 会直接拒绝（`未连接/未注册`）。
 
 ## 协议子集（RFC1459）
 
@@ -95,7 +109,7 @@ peer id 规则：
 **断线指数退避重连**（`base * 2^n`，上限 30s）并在重连成功后重新 JOIN 留驻频道。
 `host` 按 63 字节上限预留，因此切分长度是保守但安全的。
 
-未连上（首次连接中/断线重连中）时发出的正文会**排队**（最多 64 条，超出丢最旧的），
+未连上（首次连接中/断线重连中/`/irc disconnect` 之后）时发出的正文会**排队**（最多 64 条，超出丢最旧的），
 注册成功后与重新 JOIN 一起按序补发——不会静默丢消息，`deliverIrcMessage` 回的
 `"injected"` 因此是诚实的。
 
@@ -139,6 +153,7 @@ peer id 规则：
 | 现象 | 处理 |
 | --- | --- |
 | `/irc status` 说「未配置 server」 | 写 `<agentDir>/irc.json` 或设 `IRC_SERVER` |
+| 状态栏 `IRC ○ 未连接（/irc connect）` | 有人执行过 `/irc disconnect`（或本次会话还没连接）：`/irc connect` 重连 |
 | 状态栏 `IRC ◌ 重连中（第 N 次）` | server 不可达/被断开，客户端在指数退避重连；日志里有目标与延迟 |
 | 昵称被占用 | 自动加 `_` 重试；`/irc status` 显示最终昵称 |
 | 收不到频道消息 | 确认 `channels` 配了或 `/irc join` 过；频道消息只发给频道成员 |
@@ -202,7 +217,10 @@ logging:
 - `test/protocol.test.ts`：CRLF 分帧、`parseIrcLine`、512 字节切分、注册/`PING`→`PONG`/`JOIN`/433/退避重连与重新 JOIN。
 - `test/peers.test.ts`：peer 注册面（`transcriptOnly`/`sessionFile`/`activity`/故意抛错）、入站投递 + 转录落行、出站 `deliverIrcMessage` → `PRIVMSG`。
 - `test/transcript.test.ts`：转录格式、原文不截断、滚动窗口、尾部读取、显示前净化。
-- `test/e2e-mock.ts`：两个真实 `IrcClient` 互相对话（含真实扩展入口 `index.ts` 的装配冒烟）。
+- `test/commands.test.ts`：`/irc connect|disconnect` 的决策与文案（未配置时不碰客户端、已在连接不重复 start、
+  断开后 `status` 给出重连入口）、以及 `status` 的连接状态机（未连接 / 连接中 / 重连中 / 已注册）。
+- `test/e2e-mock.ts`：两个真实 `IrcClient` 互相对话（含真实扩展入口 `index.ts` 的装配冒烟，
+  以及 `/irc disconnect` → 排队不上线 → `/irc connect` 重新 JOIN 并补发的往返）。
 - `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock IRC server，证明扩展在真宿主里 JOIN 后，入站频道/私聊消息落进 peer 转录（Hub `⏎` 与 `history://` 读的那份）。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。
 
 测试不睡真实时间：等待全部走事件驱动的 `Gate` / `server.waitForLine` / `server.waitUntil`。

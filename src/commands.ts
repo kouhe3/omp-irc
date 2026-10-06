@@ -12,6 +12,8 @@ import { formatTranscriptDigest, type TranscriptEntry } from "./transcript";
 export const IRC_HELP = [
 	"/irc 子命令：",
 	"- status：连接/注册/频道/已登记 peer + 配置说明（默认）",
+	"- connect：连接 IRC server（session 启动时已自动连接；断开后用这条重连）",
+	"- disconnect：断开并停止自动重连（peer 登记与转录保留，connect 可随时回来）",
 	"- list：已知 IRC 会话（id / 别名 / 最近活跃）",
 	"- log <peer> [条数]：最近的完整消息记录（主会话卡片正文有上限，长文看这里）",
 	"- say <peer> <正文>：以本会话身份发一条 PRIVMSG（模型侧照旧用 write agent://<peer>）",
@@ -72,25 +74,51 @@ export interface IrcCommandChannel {
 	status(): IrcClientStatus;
 }
 
+/**
+ * 连接控制面（index.ts 注入）。命令层只负责「判断该不该调」与文案，连接本体在客户端；
+ * `isStarted` 必须与状态栏同一个事实（index.ts 的 `runtime.started`），否则 `/irc status`
+ * 会与状态栏打架。
+ */
+export interface IrcConnectionControl {
+	/** 本会话是否已发起连接（含正在重连）。 */
+	isStarted(): boolean;
+	/** 发起连接（含自动重连）；已发起时是 no-op。 */
+	connect(): void;
+	/** 断开并停止自动重连；已断开时是 no-op。 */
+	disconnect(): void;
+}
+
 export interface IrcCommandDeps {
 	config: IrcConfig;
 	/** 启动配置说明（缺 server 等），status 原样列出。 */
 	notes: string[];
 	peers: PeerDirectory;
 	client: IrcCommandChannel;
+	/** connect / disconnect 子命令的执行面。 */
+	connection: IrcConnectionControl;
 	/** 出站投递（与 PeerDirectory 用的是同一个实现：发 PRIVMSG 并落转录）。 */
 	send: (peer: PeerRecord, text: string) => Promise<void>;
 	transcripts: { tail(peerId: string, limit: number): TranscriptEntry[]; pathFor(peerId: string): string };
 	logger: IrcLogger;
 }
 
+/** 连接状态一句话（status 与 connect 共用；与 index.ts 状态栏同一套状态机）。 */
+function connectionState(deps: IrcCommandDeps): string {
+	const status = deps.client.status();
+	if (!deps.connection.isStarted()) {
+		return deps.config.configured ? "未连接（/irc connect 可连接）" : "未连接";
+	}
+	// attempts 是「连续重连次数」：0 = 首次连接还在握手，别把它写成「重连中（第 0 次）」。
+	if (!status.connected) return status.attempts > 0 ? `重连中（第 ${status.attempts} 次）` : "连接中…";
+	return status.registered ? "已连接 · 已注册" : "已连接 · 注册中";
+}
+
 function statusText(deps: IrcCommandDeps): string {
 	const status = deps.client.status();
-	const state = !status.connected ? "未连接" : status.registered ? "已连接 · 已注册" : "已连接 · 注册中";
 	const endpoint = status.server ? `${status.server}:${status.port}${status.tls ? " TLS" : " 明文"}` : "未配置";
 	const lines = [
-		`IRC：${state}（${endpoint}）`,
-		`昵称：${status.nick}${status.attempts > 0 ? `（重连尝试 ${status.attempts}）` : ""}`,
+		`IRC：${connectionState(deps)}（${endpoint}）`,
+		`昵称：${status.nick}`,
 		`留驻频道：${status.channels.length > 0 ? status.channels.join("、") : "(无)"}`,
 		`已登记 peer：${deps.peers.list().length}`,
 		...deps.notes.map(note => `· ${note}`),
@@ -110,6 +138,28 @@ export async function runIrcCommand(deps: IrcCommandDeps, args: string): Promise
 				return { text: IRC_HELP, level: "info" };
 			case "status":
 				return { text: statusText(deps), level: "info" };
+			case "connect": {
+				if (!deps.config.configured) {
+					return {
+						text: ["未配置 IRC server，无法连接", ...deps.notes.map(note => `· ${note}`)].join("\n"),
+						level: "warning",
+					};
+				}
+				if (deps.connection.isStarted()) {
+					return { text: `已经在连接：${connectionState(deps)}（要重连先 /irc disconnect）`, level: "info" };
+				}
+				deps.connection.connect();
+				const status = deps.client.status();
+				return {
+					text: `已发起连接 ${status.server}:${status.port}${status.tls ? "（TLS）" : ""}，昵称 ${status.nick}；结果看状态栏或 /irc status`,
+					level: "info",
+				};
+			}
+			case "disconnect": {
+				if (!deps.connection.isStarted()) return { text: "IRC 未在连接（无需断开）", level: "info" };
+				deps.connection.disconnect();
+				return { text: "已断开 IRC 并停止自动重连（peer 登记与转录保留，/irc connect 可重连）", level: "info" };
+			}
 			case "list": {
 				const known = deps.peers.list();
 				return {

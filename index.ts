@@ -4,6 +4,7 @@
  * 装配顺序（配置/依赖都在这里注入，核心模块不碰宿主）：
  *   config → PeerTranscripts → PeerDirectory(注册 peer 替身) → IrcClient → 入站桥接
  * 生命周期：主会话 session_start 连接，session_shutdown 断开并注销 peer 替身；
+ * `/irc disconnect` / `/irc connect` 可随时在同一会话里换手（断开只停传输层，peer 与转录保留）；
  * 子会话（task/`/tan`）不重复连接——IRC 连接是进程级单例。
  *
  * 配置见 README；最小可用：`<agentDir>/irc.json` 写 `{"server":"irc.example.org","nick":"omp"}`，
@@ -49,14 +50,39 @@ let runtime: IrcRuntime | undefined;
 function statusText(target: IrcRuntime): string {
 	if (!target.config.configured) return "IRC ⨯ 未配置";
 	const status = target.client.status();
-	if (!target.started) return "IRC ○ 未连接";
+	if (!target.started) return "IRC ○ 未连接（/irc connect）";
 	if (status.registered) return `IRC ● 已连接（${target.peers.list().length} 会话）`;
 	if (status.connected) return "IRC ◌ 注册中…";
-	return `IRC ◌ 重连中（第 ${status.attempts} 次）`;
+	return status.attempts > 0 ? `IRC ◌ 重连中（第 ${status.attempts} 次）` : "IRC ◌ 连接中…";
 }
 
 function updateStatus(target: IrcRuntime): void {
 	target.ui.setStatus(IRC_STATUS_KEY, statusText(target));
+}
+
+/** 发起连接（含自动重连）；重复调用是 no-op。连接/注册结果由回调与状态栏呈现。 */
+function connectRuntime(target: IrcRuntime): void {
+	if (target.started) return;
+	target.started = true;
+	target.logger.info("IRC 发起连接", {
+		server: target.config.server,
+		port: target.config.port,
+		tls: target.config.tls,
+	});
+	target.client.start();
+	updateStatus(target);
+}
+
+/**
+ * 断开并停止自动重连；重复调用是 no-op。只停传输层：peer 替身与转录留在原地，
+ * 所以重连后模型手里旧的 `agent://irc-<nick>` 继续可用。
+ */
+function disconnectRuntime(target: IrcRuntime): void {
+	if (!target.started) return;
+	target.started = false;
+	target.client.stop();
+	target.logger.info("IRC 已断开（/irc connect 可重连）");
+	updateStatus(target);
 }
 
 function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): IrcRuntime {
@@ -164,7 +190,8 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerTool(defineIrcTool(pi, deps));
 
 	pi.registerCommand("irc", {
-		description: "IRC 渠道：status | list | log <peer> [条数] | say <peer> <正文> | join <#频道> | part <#频道>（/irc help 看全部）",
+		description:
+			"IRC 渠道：status | connect | disconnect | list | log <peer> [条数] | say <peer> <正文> | join <#频道> | part <#频道>（/irc help 看全部）",
 		handler: async (args, ctx) => {
 			const current = runtime;
 			if (!current) {
@@ -177,6 +204,11 @@ export default function (pi: ExtensionAPI): void {
 					notes: current.notes,
 					peers: current.peers,
 					client: current.client,
+					connection: {
+						isStarted: () => current.started,
+						connect: () => connectRuntime(current),
+						disconnect: () => disconnectRuntime(current),
+					},
 					send: current.send,
 					transcripts: current.transcripts,
 					logger: current.logger,
@@ -197,10 +229,7 @@ export default function (pi: ExtensionAPI): void {
 			updateStatus(current);
 			return;
 		}
-		if (!current.started) {
-			current.started = true;
-			current.client.start();
-		}
+		connectRuntime(current);
 		updateStatus(current);
 	});
 
