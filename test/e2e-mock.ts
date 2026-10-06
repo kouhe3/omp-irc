@@ -268,6 +268,44 @@ try {
 	await toolDefinition?.execute("call-2", { action: "say", peer: "peerbot", text: "reply via tool" }, undefined, undefined, extCtx);
 	check(await server.waitForLine(/^PRIVMSG peerbot :reply via tool$/).catch(() => "") === "PRIVMSG peerbot :reply via tool", "irc say 工具发出了 PRIVMSG");
 
+	// 8b) /irc disconnect → /irc connect：同一会话内换手。真 TCP 上验四件事：
+	//     断开后 server 侧连接消失、断开期间的出站排队不上线、重连后重新 JOIN 留驻频道、排队正文被补发。
+	//     出站走**扩展自己的** peer 替身（上面 say 已把它登记进 registry，覆盖了独立链路的那个）。
+	const extAdapter = refs.get("irc-peerbot")?.session as { deliverIrcMessage?: (message: { from: string; to: string; body: string }) => Promise<unknown> };
+	const extJoinsBefore = server.received.filter(line => line === "JOIN #ext").length;
+	await commandDefinition?.handler("disconnect", extCtx);
+	check(statuses.at(-1) === "IRC ○ 未连接（/irc connect）", "/irc disconnect 后状态栏变成未连接（带重连提示）", String(statuses.at(-1)));
+	check(notices.at(-1)?.includes("已断开 IRC") === true, "/irc disconnect 回报断开", notices.at(-1) ?? "");
+	await server.waitUntil(() => !server.nicks().includes("ompext"), "ompext 已从 server 掉线");
+	check(server.channelsOf("ompext").length === 0, "断开后不在任何频道里", server.channelsOf("ompext").join(","));
+	await commandDefinition?.handler("status", extCtx);
+	check(
+		notices.at(-1)?.startsWith("IRC：未连接（/irc connect 可连接）") === true,
+		"/irc status 在断开后给出重连入口",
+		notices.at(-1)?.split("\n")[0] ?? "",
+	);
+
+	const downReceipt = String(await extAdapter.deliverIrcMessage?.({ from: "Main", to: "irc-peerbot", body: "queued while disconnected" }));
+	check(downReceipt === "injected", "断开期间的出站仍被受理（排队，不丢）", downReceipt);
+	check(
+		!server.received.some(line => line.includes("queued while disconnected")),
+		"断开期间一个字节都没上线",
+		server.received.filter(line => line.startsWith("PRIVMSG")).slice(-2).join(" | "),
+	);
+
+	await commandDefinition?.handler("connect", extCtx);
+	check(notices.at(-1)?.includes("已发起连接") === true, "/irc connect 回报已发起连接", notices.at(-1) ?? "");
+	check(statuses.at(-1) === "IRC ◌ 连接中…", "刚发起连接时状态栏是连接中（不是重连中）", String(statuses.at(-1)));
+	// onRegistered 先于 JOIN 发生（client 处理 001 → 刷状态 → 再发 JOIN），所以 server 看到 JOIN 时状态栏已更新。
+	await server.waitForJoin("#ext");
+	check(statuses.at(-1)?.startsWith("IRC ● 已连接") === true, "重连后状态栏回到已连接", String(statuses.at(-1)));
+	check(server.channelsOf("ompext").includes("#ext"), "重连后重新 JOIN 了 #ext", server.channelsOf("ompext").join(","));
+	check(server.received.filter(line => line === "JOIN #ext").length > extJoinsBefore, "重新 JOIN 真的走了一遍");
+	check(
+		await server.waitForLine(/^PRIVMSG peerbot :queued while disconnected$/).catch(() => "") === "PRIVMSG peerbot :queued while disconnected",
+		"重连后补发断开期间排队的正文",
+	);
+
 	await handlers.get("session_shutdown")?.({}, extCtx);
 	check(statuses.at(-1) === undefined, "退出时清掉状态栏那一格");
 	check(refs.get("irc-peerbot") === undefined, "退出时注销 peer 替身");
@@ -282,28 +320,39 @@ try {
 		`${bare.config.port} ${bare.config.nick} tls=${bare.config.tls}`,
 	);
 	check(bare.notes.some(note => note.includes("未配置 server")), "notes 说明缺什么", bare.notes.join(" / "));
-	const bareStatus = await runIrcCommand(
-		{
-			config: bare.config,
-			notes: bare.notes,
-			peers,
-			// 未配置时没有连接：用「未连接」的客户端形状代表这种状态。
-			client: {
-				join: () => {},
-				part: () => {},
-				status: () => ({ server: "", port: 6667, tls: false, nick: "omp", connected: false, registered: false, channels: [], attempts: 0 }),
-			},
-			send: async () => {},
-			transcripts,
-			logger: silentLogger,
+	// 未配置时没有连接：用「未连接」的客户端形状代表这种状态，连接控制面记下有没有被误调用。
+	const bareCalls: string[] = [];
+	const bareDeps = {
+		config: bare.config,
+		notes: bare.notes,
+		peers,
+		client: {
+			join: () => {},
+			part: () => {},
+			status: () => ({ server: "", port: 6667, tls: false, nick: "omp", connected: false, registered: false, channels: [], attempts: 0 }),
 		},
-		"status",
-	);
+		connection: {
+			isStarted: () => false,
+			connect: () => bareCalls.push("connect"),
+			disconnect: () => bareCalls.push("disconnect"),
+		},
+		send: async () => {},
+		transcripts,
+		logger: silentLogger,
+	};
+	const bareStatus = await runIrcCommand(bareDeps, "status");
 	check(
 		bareStatus.text.includes("未配置 server") && bareStatus.text.includes("IRC：未连接"),
 		"/irc status 说明缺什么",
 		bareStatus.text.split("\n").slice(0, 2).join(" / "),
 	);
+	const bareConnect = await runIrcCommand(bareDeps, "connect");
+	check(
+		bareConnect.level === "warning" && bareConnect.text.includes("未配置 IRC server") && bareConnect.text.includes("IRC_SERVER"),
+		"/irc connect 未配置时拒绝并说明缺什么",
+		bareConnect.text.split("\n")[0] ?? "",
+	);
+	check(bareCalls.length === 0, "未配置时 connect/disconnect 都没碰客户端", bareCalls.join(","));
 
 	const fromEnv = loadConfig(bareDir, {
 		env: { IRC_SERVER: "irc.example.org", IRC_TLS: "1", IRC_NICK: "bot", IRC_CHANNELS: "#a,#b" },
