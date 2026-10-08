@@ -45,9 +45,9 @@ export interface IrcConfig {
 	password?: string;
 	/** 每个 peer 的 jsonl 转录落脚目录。 */
 	transcriptDir: string;
-	/** 心跳间隔（秒）：>0 启用（静默这么久就发 `PING`）；0 = 关闭（缺省）。 */
+	/** 心跳间隔（秒）：>0 启用（静默这么久就发 `PING`）；0 = 关闭。缺省 60。 */
 	keepaliveSeconds: number;
-	/** 发出 `PING` 后多久没有任何入站行就判定连接已死（秒）；缺省 = `keepaliveSeconds`。 */
+	/** 发出 `PING` 后多久没有任何入站行就判定连接已死（秒）。缺省 30：这只是等一个 PONG 的预算，与间隔无关。 */
 	keepaliveTimeoutSeconds?: number;
 	configPath: string;
 	/** 能连 server 的前提：server + nick 齐备。 */
@@ -79,6 +79,15 @@ const MAX_PORT = 65_535;
 /** 心跳秒数上限（一天）：再大就没意义了，多半是写错。 */
 const MAX_SECONDS = 24 * 60 * 60;
 
+/**
+ * 心跳默认开：半开连接（对端已把我们踢掉、FIN 却没到达本机）不会产生任何 socket 事件，
+ * 只靠 `close` 驱动的重连永远不会触发，状态栏会一直显示「已连接」。60s 也小于常见 ircd
+ * 的 idle ping 阈值，顺带避免服务端以 ping timeout 踢人。
+ */
+export const DEFAULT_KEEPALIVE_SECONDS = 60;
+/** 判死预算（等一个 PONG 的时间）：不随间隔放大，间隔拉长也不该更晚发现断线。 */
+export const DEFAULT_KEEPALIVE_TIMEOUT_SECONDS = 30;
+
 function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
@@ -99,6 +108,13 @@ function asBoolean(value: unknown): boolean | undefined {
 function asSeconds(value: unknown): number | undefined {
 	const raw = typeof value === "number" ? value : asString(value) === undefined ? undefined : Number(asString(value));
 	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > MAX_SECONDS) return undefined;
+	return raw;
+}
+
+/** 心跳间隔：口径同 {@link asSeconds}，但 **0 合法**（= 关闭心跳；这一档必须能写出来）。 */
+function asKeepaliveSeconds(value: unknown): number | undefined {
+	const raw = typeof value === "number" ? value : asString(value) === undefined ? undefined : Number(asString(value));
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0 || raw > MAX_SECONDS) return undefined;
 	return raw;
 }
 
@@ -237,7 +253,7 @@ function readEnv(env: Record<string, string | undefined>, notes: string[]): EnvO
 	take("channels", env.IRC_CHANNELS, parseChannels);
 	take("password", env.IRC_PASSWORD, asString as (v: string) => string | undefined);
 	take("transcriptDir", env.IRC_TRANSCRIPT_DIR, asString as (v: string) => string | undefined);
-	take("keepaliveSeconds", env.IRC_KEEPALIVE_SECONDS, asSeconds as (v: string) => number | undefined);
+	take("keepaliveSeconds", env.IRC_KEEPALIVE_SECONDS, asKeepaliveSeconds as (v: string) => number | undefined);
 	take("keepaliveTimeoutSeconds", env.IRC_KEEPALIVE_TIMEOUT_SECONDS, asSeconds as (v: string) => number | undefined);
 	// 不走 take：空串对 nickSuffix 有语义（关闭后缀），而 take 把空串当「未设置」跳过。
 	if (env.IRC_NICK_SUFFIX !== undefined) {
@@ -288,8 +304,10 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 	const nick = nickSuffix ? `${baseNick}-${nickSuffix}` : baseNick;
 	const channels = overrides.channels ?? parseChannels(file.channels) ?? [];
 	const transcriptDir = overrides.transcriptDir ?? asString(file.transcriptDir) ?? path.join(agentDir, "irc-transcripts");
-	const keepaliveSeconds = overrides.keepaliveSeconds ?? asSeconds(file.keepaliveSeconds) ?? 0;
-	const keepaliveTimeoutSeconds = overrides.keepaliveTimeoutSeconds ?? asSeconds(file.keepaliveTimeoutSeconds);
+	const keepaliveSeconds =
+		overrides.keepaliveSeconds ?? asKeepaliveSeconds(file.keepaliveSeconds) ?? DEFAULT_KEEPALIVE_SECONDS;
+	const keepaliveTimeoutSeconds =
+		overrides.keepaliveTimeoutSeconds ?? asSeconds(file.keepaliveTimeoutSeconds) ?? DEFAULT_KEEPALIVE_TIMEOUT_SECONDS;
 
 	const config: IrcConfig = {
 		server,
@@ -327,7 +345,7 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 	else notes.push("未配置频道：只收私聊（可用 /irc join #频道 加入）");
 	if (keepaliveSeconds > 0) {
 		notes.push(
-			`心跳：每 ${keepaliveSeconds}s 发 PING，${keepaliveTimeoutSeconds ?? keepaliveSeconds}s 内无任何入站则判死重连`,
+			`心跳：每 ${keepaliveSeconds}s 发 PING，${keepaliveTimeoutSeconds}s 内无任何入站则判死重连（keepaliveSeconds=0 关闭）`,
 		);
 	}
 	if (config.password) notes.push("已配置连接密码（PASS；SASL 不支持）");

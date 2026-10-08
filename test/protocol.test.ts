@@ -312,6 +312,69 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		expect(socket.writes).toContain("PING :omp-3\r\n");
 	});
 
+	test("半开连接：服务端装死（不写任何字节、也不关 socket）→ 心跳判死并重连回房", async () => {
+		// 线上现场：Ergo 以 `Ping timeout: 2m30s` 把我们踢掉，但 ERROR/FIN 没到达本机
+		// （netstat 一直 ESTABLISHED、close 事件永不触发）→ 只有我们自己的心跳能发现并重连。
+		const server = await startServer();
+		const registered: string[] = [];
+		const client = startClient(server, {
+			// 生产缺省口径（60s/30s）的压缩版；缺省值本身在 config.test.ts 里钉住。
+			keepalive: { intervalMs: 100, timeoutMs: 100 },
+			onRegistered: () => registered.push(client.status().nick),
+		});
+		await server.waitForJoin("#omp");
+		const joinsBefore = server.received.filter(line => line === "JOIN #omp").length;
+
+		server.mute("omp"); // 服务端从此一个字节都不写，socket 仍是 ESTABLISHED
+		await server.waitUntil(
+			() => server.received.filter(line => line === "JOIN #omp").length > joinsBefore,
+			"心跳判死后重连并重新 JOIN",
+			3_000,
+		);
+
+		expect(registered).toHaveLength(2);
+		expect(client.status().registered).toBe(true);
+		expect(server.channelsOf("omp")).toEqual(["#omp"]);
+	});
+
+	test("旧 socket 迟到的 close 不得覆盖新连接（disconnect → connect 紧挨着的情况）", () => {
+		// 回归：destroy() 的 close 是异步事件。旧 socket 的 close 若在新连接建立之后才到，
+		// 旧实现会把 #socket/连接状态覆盖成新 socket 的（新连接被孤立：写不出去、还会多连一条）。
+		const sockets: FakeSocket[] = [];
+		const timers = new FakeTimers();
+		const client = new IrcClient({
+			host: "mock",
+			port: 6667,
+			nick: "omp",
+			timers,
+			reconnect: { base: 20, max: 20 },
+			socketFactory: () => {
+				const socket = new FakeSocket();
+				sockets.push(socket);
+				return socket;
+			},
+		});
+		clients.push(client);
+		client.start();
+		const first = sockets[0] as FakeSocket;
+		first.emit("connect");
+		first.emit("data", ":mock 001 omp :welcome\r\n");
+
+		client.stop(); // 旧 socket 的 close 还没到
+		client.start(); // 立刻重连（/irc connect 紧跟 /irc disconnect）
+		const second = sockets[1] as FakeSocket;
+		second.emit("connect");
+		second.emit("data", ":mock 001 omp :welcome\r\n");
+
+		first.emit("close"); // 迟到的 close
+		expect(client.status().registered).toBe(true);
+		expect(second.destroyCalls).toBe(0);
+		expect(timers.delays).toEqual([]); // 没有额外排一次重连
+		client.privmsg("alice", "still connected");
+		expect(second.writes).toContain("PRIVMSG alice :still connected\r\n");
+		expect(sockets).toHaveLength(2);
+	});
+
 	test("TCP 已连上但还没注册（001 前）的正文也排队，注册后补发", () => {
 		// 回归：旧实现以「TCP 连上」（connect 事件）为排队界，握手窗口里直接写 PRIVMSG，
 		// 服务端还没认这个客户端 → 451 丢掉；每次重连都会经过这个窗口。

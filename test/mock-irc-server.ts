@@ -17,6 +17,8 @@ interface Connection {
 	nick?: string;
 	username?: string;
 	registered: boolean;
+	/** 装死：socket 保持打开，但服务端不再写任何字节（复现半开连接现场）。 */
+	muted: boolean;
 	readonly channels: Set<string>;
 	buffer: string;
 }
@@ -55,6 +57,11 @@ export interface MockIrcServer {
 	ping(token?: string): void;
 	/** 掐断所有连接（模拟网络中断，客户端应退避重连）。 */
 	dropAll(): void;
+	/**
+	 * 让某个 nick 的连接「装死」：socket 保持打开（服务端视角仍是 ESTABLISHED），但不再向它写
+	 * 任何字节——模拟服务端已把客户端踢掉、FIN/ERROR 却没有到达客户端的半开现场。
+	 */
+	mute(nick: string): void;
 	/** 等服务端收到匹配的行。 */
 	waitForLine(pattern: RegExp, timeoutMs?: number): Promise<string>;
 	/** 等某个 nick 出现在服务端（注册完成）。 */
@@ -152,14 +159,15 @@ export async function startMockIrcServer(options: MockIrcServerOptions = {}): Pr
 		});
 	}
 
-	function writeLine(socket: Socket, line: string): void {
-		if (socket.destroyed) return;
-		socket.write(`${line}\r\n`);
+	/** 写一行；连接被标记「装死」（{@link Connection.muted}）时一个字节都不写（socket 仍打开）。 */
+	function writeLine(conn: Connection, line: string): void {
+		if (conn.muted || conn.socket.destroyed) return;
+		conn.socket.write(`${line}\r\n`);
 	}
 
 	function broadcast(line: string, except?: Connection): void {
 		for (const conn of connections()) {
-			if (conn !== except) writeLine(conn.socket, line);
+			if (conn !== except) writeLine(conn, line);
 		}
 	}
 
@@ -167,19 +175,19 @@ export async function startMockIrcServer(options: MockIrcServerOptions = {}): Pr
 	function deliver(target: string, line: string, except?: Connection): void {
 		if (target.startsWith("#") || target.startsWith("&")) {
 			for (const conn of connections()) {
-				if (conn !== except && conn.channels.has(target)) writeLine(conn.socket, line);
+				if (conn !== except && conn.channels.has(target)) writeLine(conn, line);
 			}
 			return;
 		}
 		for (const conn of connections()) {
-			if (conn !== except && conn.nick === target) writeLine(conn.socket, line);
+			if (conn !== except && conn.nick === target) writeLine(conn, line);
 		}
 	}
 
 	function maybeWelcome(conn: Connection): void {
 		if (conn.registered || !conn.nick || !conn.username) return;
 		conn.registered = true;
-		writeLine(conn.socket, `:mock 001 ${conn.nick} :Welcome to the mock IRC network`);
+		writeLine(conn, `:mock 001 ${conn.nick} :Welcome to the mock IRC network`);
 		pump();
 	}
 
@@ -191,7 +199,7 @@ export async function startMockIrcServer(options: MockIrcServerOptions = {}): Pr
 			case "NICK": {
 				const wanted = params[0] ?? "";
 				if (taken.has(wanted)) {
-					writeLine(conn.socket, `:mock 433 * ${wanted} :Nickname is already in use`);
+					writeLine(conn, `:mock 433 * ${wanted} :Nickname is already in use`);
 					return;
 				}
 				conn.nick = wanted;
@@ -204,7 +212,7 @@ export async function startMockIrcServer(options: MockIrcServerOptions = {}): Pr
 				return;
 			}
 			case "PING": {
-				writeLine(conn.socket, `:mock PONG mock :${params[0] ?? ""}`);
+				writeLine(conn, `:mock PONG mock :${params[0] ?? ""}`);
 				return;
 			}
 			case "JOIN": {
@@ -243,7 +251,7 @@ export async function startMockIrcServer(options: MockIrcServerOptions = {}): Pr
 
 	const server = net.createServer(socket => {
 		socket.setEncoding("utf8");
-		const conn: Connection = { socket, registered: false, channels: new Set(), buffer: "" };
+		const conn: Connection = { socket, registered: false, muted: false, channels: new Set(), buffer: "" };
 		conns.add(conn);
 		socket.on("data", chunk => {
 			conn.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
@@ -277,13 +285,16 @@ export async function startMockIrcServer(options: MockIrcServerOptions = {}): Pr
 		channelsOf,
 		send: line => broadcast(line),
 		sendTo: (nick, line) => {
-			for (const conn of connections()) if (conn.nick === nick) writeLine(conn.socket, line);
+			for (const conn of connections()) if (conn.nick === nick) writeLine(conn, line);
 		},
 		simulatePrivmsg: (from, target, text) => deliver(target, `:${from}!mock@${host} PRIVMSG ${target} :${text}`),
 		simulateNotice: (from, target, text) => deliver(target, `:${from}!mock@${host} NOTICE ${target} :${text}`),
 		ping: (token = "keepalive") => broadcast(`PING :${token}`),
 		dropAll: () => {
 			for (const conn of connections()) conn.socket.destroy();
+		},
+		mute: nick => {
+			for (const conn of connections()) if (conn.nick === nick) conn.muted = true;
 		},
 		waitForLine: async (pattern, timeoutMs) => {
 			await wait(() => received.some(line => pattern.test(line)), `匹配行 ${pattern}`, timeoutMs);

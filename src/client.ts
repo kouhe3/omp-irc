@@ -410,18 +410,30 @@ export class IrcClient {
 		}
 		this.#socket = socket;
 		this.#buffer = "";
+		// 所有事件都按 socket 身份守卫：`destroy()` 的 close 是异步到达的，旧 socket 的 close 若在
+		// 新连接建立之后才到（`/irc disconnect` 紧跟 `/irc connect`），未加守卫就会把新连接的
+		// 句柄与状态覆盖掉（新连接被孤立：写不出去，还会多连一条）。
 		socket.on("connect", () => {
+			if (this.#socket !== socket) return;
 			this.#connected = true;
 			this.#attempts = 0;
 			this.register();
 		});
-		socket.on("data", chunk => this.#consume(typeof chunk === "string" ? chunk : chunk.toString("utf8")));
-		socket.on("error", error => this.#emitError(error));
+		socket.on("data", chunk => {
+			if (this.#socket !== socket) return;
+			this.#consume(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+		});
+		socket.on("error", error => {
+			if (this.#socket !== socket) return;
+			this.#emitError(error);
+		});
 		// error 之后必然 close：断线处理只放这里，避免重复回调。
-		socket.on("close", () => this.#onClose());
+		socket.on("close", () => this.#onClose(socket));
 	}
 
-	#onClose(): void {
+	/** 当前连接的 close：把状态归零并排重连。已 stop / 已被新连接接管的旧 socket 到这里直接退出。 */
+	#onClose(socket: IrcSocket): void {
+		if (this.#socket !== socket) return;
 		const wasConnected = this.#connected;
 		this.#socket = undefined;
 		this.#buffer = "";

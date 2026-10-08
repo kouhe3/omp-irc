@@ -196,6 +196,9 @@ try {
 			nick: "ompext",
 			channels: ["#ext"],
 			transcriptDir: path.join(root, "ext-transcripts"),
+			// 心跳口径压到秒级：下面要验「服务端装死 → 判死 → 重连」，缺省是 60s/30s。
+			keepaliveSeconds: 1,
+			keepaliveTimeoutSeconds: 1,
 		}),
 		"utf8",
 	);
@@ -313,6 +316,18 @@ try {
 		"重连后补发断开期间排队的正文",
 	);
 
+	// 8c) 半开连接（线上实测的故障形态）：服务端把我们踢掉、FIN 却没到达本机——socket 一直
+	//     ESTABLISHED、没有任何事件，只有心跳能发现。这里让服务端「装死」：不再写任何字节，也不关 socket。
+	const joinsBeforeMute = server.received.filter(line => line === "JOIN #ext").length;
+	server.mute(extNick);
+	await server.waitUntil(
+		() => server.received.filter(line => line === "JOIN #ext").length > joinsBeforeMute,
+		"半开判死后自动重连并重新 JOIN",
+		10_000,
+	);
+	check(statuses.at(-1)?.startsWith(`IRC ● ${extNick}`) === true, "半开判死后状态栏回到已连接（不再假装在线）", String(statuses.at(-1)));
+	check(server.channelsOf(extNick).includes("#ext"), "半开判死重连后重新 JOIN 了 #ext", server.channelsOf(extNick).join(","));
+
 	await handlers.get("session_shutdown")?.({}, extCtx);
 	check(statuses.at(-1) === undefined, "退出时清掉状态栏那一格");
 	check(refs.get("irc-peerbot") === undefined, "退出时注销 peer 替身");
@@ -383,8 +398,23 @@ try {
 		fromEnv.notes.join(" / "),
 	);
 
-	// 心跳缺省关闭；IRC_KEEPALIVE_SECONDS 打开并写进 notes（客户端侧行为见 protocol.test.ts）。
-	check(bare.config.keepaliveSeconds === 0, "心跳缺省关闭", `keepaliveSeconds=${bare.config.keepaliveSeconds}`);
+	// 心跳缺省开启（60s/30s）：半开连接只能靠它发现（客户端侧行为见 protocol.test.ts 的装死用例）。
+	check(
+		bare.config.keepaliveSeconds === 60 && bare.config.keepaliveTimeoutSeconds === 30,
+		"心跳缺省开启（60s 发 PING / 30s 判死）",
+		`${bare.config.keepaliveSeconds}/${bare.config.keepaliveTimeoutSeconds}`,
+	);
+	check(
+		bare.notes.some(note => note.includes("心跳：每 60s 发 PING，30s 内无任何入站则判死重连")),
+		"缺省心跳写进 notes",
+		bare.notes.join(" / "),
+	);
+	const keepaliveOff = loadConfig(bareDir, { env: { IRC_KEEPALIVE_SECONDS: "0" }, notes: [] });
+	check(
+		keepaliveOff.config.keepaliveSeconds === 0 && !keepaliveOff.notes.some(note => note.includes("心跳")),
+		"IRC_KEEPALIVE_SECONDS=0 关闭心跳（不再写心跳说明）",
+		`keepaliveSeconds=${keepaliveOff.config.keepaliveSeconds}`,
+	);
 	const keepaliveEnv = loadConfig(bareDir, {
 		env: { IRC_KEEPALIVE_SECONDS: "60", IRC_KEEPALIVE_TIMEOUT_SECONDS: "20" },
 		notes: [],

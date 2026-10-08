@@ -51,8 +51,8 @@ bun run test/e2e-mock.ts    # 端到端（真 TCP + mock server + 真实扩展�
 | `channels` | `[]` | 启动即 JOIN 的频道；空则只收私聊 |
 | `password` | 无 | **连接密码**（IRC `PASS`），不是 SASL |
 | `transcriptDir` | `<agentDir>/irc-transcripts` | 每个 peer 的 jsonl 转录目录 |
-| `keepaliveSeconds` | `0`（关闭） | 心跳：每这么久主动发一次 `PING :token`。真实 ircd 上的半开连接（看着在线、实际已死）靠它发现 |
-| `keepaliveTimeoutSeconds` | = `keepaliveSeconds` | 发出 `PING` 后这么久内**没有任何入站行**（服务端 PING、别人的消息都算）就判死：断开并走既有退避重连 |
+| `keepaliveSeconds` | `60`（`0` 关闭心跳） | 心跳：每这么久主动发一次 `PING :token`。**半开连接只能靠它发现**——对端把我们踢掉、FIN 却没到达本机时不会产生任何 socket 事件（`netstat` 一直 ESTABLISHED，`close` 永不触发），只靠 `close` 驱动的重连永远不会触发。60s 也小于常见 ircd 的 idle ping 阈值，顺带让服务端的 `Ping timeout` 等不到超时 |
+| `keepaliveTimeoutSeconds` | `30` | 发出 `PING` 后这么久内**没有任何入站行**（PONG、服务端 PING、别人的消息都算）就判死：断开并走既有退避重连。这只是**等一个 PONG 的预算**，与间隔无关——间隔拉长不会让断线更晚被发现 |
 
 同名环境变量可覆盖（优先级高于文件，逐条日志会说明哪个生效）：
 
@@ -129,7 +129,9 @@ peer id 规则：
 `PRIVMSG`/`NOTICE` 收发、`001`（RPL_WELCOME，据此触发重连后的重新 JOIN）、
 `433`（昵称占用自动换名）、CRLF 逐行分帧（容忍半行与一次多行）、
 **正文按 512 字节上限切分**（不切碎 UTF-8 字符，优先在空格/换行处断开）、
-**断线指数退避重连**（`base * 2^n`，上限 30s）并在重连成功后重新 JOIN 留驻频道。
+**断线指数退避重连**（`base * 2^n`，上限 30s）并在重连成功后重新 JOIN 留驻频道；
+**底层心跳**（缺省 60s 发 `PING`、30s 无任何入站就判死走同一条重连路径）——`close`/`error` 事件
+在半开连接上根本不会到，重连不能只靠它们驱动。
 `host` 按 63 字节上限预留，因此切分长度是保守但安全的。
 
 未连上（首次连接中/断线重连中/`/irc disconnect` 之后）时发出的正文会**排队**（最多 64 条，超出丢最旧的），
@@ -185,7 +187,8 @@ peer id 规则：
 | 模型看不到消息 | 主会话未注册（headless/未启动）时入站只落转录并 warn 日志 |
 | 长消息看不全 | 主会话卡片正文有上限；用 `/irc log <peer>` 或 Hub 里 `⏎` 看转录 |
 | Hub 里 `⏎` 只得到「是外部渠道端点」的拒绝 | 宿主未支持 `transcriptOnly`（stock omp ≤ 18.6.1）：换支持它的 fork 宿主，或改用 `/irc log <peer>` |
-| 显示已连接但长时间收不到消息、对侧也看不到你 | 半开连接（NAT/防火墙掐断且不报错）：设 `keepaliveSeconds: 60`，超时判定后会自动重连 |
+| 状态栏显示已连接，但对侧看到你「退出: Ping timeout」，且你收不到消息 | 半开连接（NAT/防火墙掐断且不报错：对端的 `ERROR`/FIN 到不了本机）。缺省心跳（60s/30s）会在 ≤90s 内判死并自动重连；若把 `keepaliveSeconds` 设成 `0` 就永远不会重连——改回缺省即可。日志里出现 `IRC 心跳超时，判定连接已死` 就是这条路径 |
+| 日志里反复出现 `IRC 心跳超时` | 链路真的收不到任何入站（代理/防火墙只放行出站）：换线路，或按需调大 `keepaliveTimeoutSeconds` |
 
 日志全部带 `IRC` 前缀（`IRC 已注册` / `IRC 转录写入失败` / `IRC 入站投递失败` 等），连接目标与每个配置来源都会在 `session_start` 记一遍。
 

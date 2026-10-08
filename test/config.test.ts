@@ -117,3 +117,26 @@ describe("loadConfig 的最终昵称", () => {
 		expect(notes.some(note => note.includes(`已占满 ${NICK_MAX_LENGTH} 字符`))).toBe(true);
 	});
 });
+
+describe("keepalive 缺省", () => {
+	test("缺省开启：60s 发一次 PING，30s 内无任何入站就判死重连", () => {
+		// 回归（线上实测）：Ergo 以 `Ping timeout: 2m30s` 把客户端踢掉，但 FIN 没到达本机
+		// （netstat 一直 ESTABLISHED、close 事件永不触发）→ 缺省关心跳时永远不会重连。
+		const { config, notes } = load(freshDir(), { IRC_SERVER: "irc.example.org" });
+		expect(config.keepaliveSeconds).toBe(60);
+		expect(config.keepaliveTimeoutSeconds).toBe(30);
+		expect(notes.some(note => note.includes("心跳：每 60s 发 PING，30s 内无任何入站则判死重连"))).toBe(true);
+	});
+
+	test("keepaliveSeconds=0 关闭心跳（不再写心跳说明）", () => {
+		const { config, notes } = load(freshDir(), { IRC_SERVER: "irc.example.org", IRC_KEEPALIVE_SECONDS: "0" });
+		expect(config.keepaliveSeconds).toBe(0);
+		expect(notes.some(note => note.includes("心跳"))).toBe(false);
+	});
+
+	test("判死截止缺省固定 30s，不随间隔放大（间隔拉到 300s 也一样）", () => {
+		const { config } = load(freshDir(), { IRC_SERVER: "irc.example.org", IRC_KEEPALIVE_SECONDS: "300" });
+		expect(config.keepaliveSeconds).toBe(300);
+		expect(config.keepaliveTimeoutSeconds).toBe(30);
+	});
+});
