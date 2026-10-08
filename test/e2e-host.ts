@@ -5,11 +5,13 @@
  * 默认起扩展自带的 mock IRC server；`IRC_E2E_SERVER=host:port` 时改连**外部 ircd**
  * （此时用一根裸 TCP socket 当"人类"客户端发言），用来验证真实 ircd 的互操作。
  * 连外部 ircd 时 bot 昵称会带随机后缀，避免和已在线客户端撞名。
+ * 心跳不设走扩展缺省（60s/30s）；调低（`IRC_KEEPALIVE_SECONDS=2 IRC_KEEPALIVE_TIMEOUT_SECONDS=1`）
+ * 可以在几秒内顺带覆盖心跳路径（真 ircd 会回我们的 PONG）。
  *
  * 宿主默认取 PATH 上的 `omp`；**注意** `Bun.spawn(["omp"])` 会先命中本扩展
  * `node_modules/.bin/omp`（devDependency 钉的发行版），要验证 fork/源码宿主必须覆盖：
  *   IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host
- *   IRC_E2E_SERVER=jiaoxing.xin:6667 IRC_KEEPALIVE_SECONDS=2 bun run e2e:host   # 真 ircd + 心跳
+ *   IRC_E2E_SERVER=jiaoxing.xin:6667 bun run e2e:host   # 真 ircd（缺省心跳）
  */
 import { spawn } from "bun";
 import * as fs from "node:fs";
@@ -39,6 +41,9 @@ const botNick = `${botNickBase}-${workspaceTag(tmp)}`;
 let human: net.Socket | undefined;
 const humanFrames: string[] = [];
 if (EXTERNAL) {
+	// 外部 ircd 是共享服务：硬编码的人类昵称（曾经的 `kouhe3`）随时可能已经在线，撞名 → 433 →
+	// 这一侧永远注册不上、JOIN 也发不出去，于是断言全挂而看不出原因。人类侧同样用随机昵称。
+	const humanNick = `human-e2e-${Date.now().toString(36).slice(-4)}`;
 	human = net.createConnection({ host: serverHost, port: Number(serverPort) });
 	human.setEncoding("utf8");
 	let buf = "";
@@ -49,8 +54,11 @@ if (EXTERNAL) {
 		humanFrames.push(...lines);
 	});
 	await new Promise<void>(resolve => human?.once("connect", () => resolve()));
-	human.write(`NICK kouhe3\r\nUSER kouhe3 0 * :human\r\n`);
+	human.write(`NICK ${humanNick}\r\nUSER ${humanNick} 0 * :human\r\n`);
 	for (let i = 0; i < 40 && !humanFrames.some(line => line.split(" ")[1] === "001"); i++) await Bun.sleep(250);
+	if (!humanFrames.some(line => line.split(" ")[1] === "001")) {
+		console.log(`human（${humanNick}）未注册成功：`, humanFrames.slice(-3).join(" ⏎ "));
+	}
 	human.write(`JOIN ${CHANNEL}\r\n`);
 	await Bun.sleep(400);
 }
@@ -79,7 +87,12 @@ const host = spawn([...hostCommand, "--mode", "rpc"], {
 		IRC_NICK_SUFFIX: "{workspace}",
 		IRC_CHANNELS: CHANNEL,
 		IRC_TRANSCRIPT_DIR: transcriptDir,
-		IRC_KEEPALIVE_SECONDS: process.env.IRC_KEEPALIVE_SECONDS ?? "0",
+		// 不设就走扩展缺省心跳（60s/30s）：真 ircd 上这条路径本身也要被覆盖。
+		// 调低（如 IRC_KEEPALIVE_SECONDS=2）可以顺带验真 ircd 会回 PONG。
+		...(process.env.IRC_KEEPALIVE_SECONDS ? { IRC_KEEPALIVE_SECONDS: process.env.IRC_KEEPALIVE_SECONDS } : {}),
+		...(process.env.IRC_KEEPALIVE_TIMEOUT_SECONDS
+			? { IRC_KEEPALIVE_TIMEOUT_SECONDS: process.env.IRC_KEEPALIVE_TIMEOUT_SECONDS }
+			: {}),
 	},
 });
 void (async () => {
