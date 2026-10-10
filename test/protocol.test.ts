@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	IrcClient,
 	MAX_IRC_BYTES,
+	REGISTER_TIMEOUT_MS,
 	parseIrcLine,
 	payloadBudget,
 	splitByBytes,
@@ -194,6 +195,8 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		expect(timers.delays).toEqual([20, 40, 80, 80]);
 
 		sockets.at(-1)?.emit("connect");
+		// 退避只在「注册成功」时归零（TCP 连上不算可用）：先给 001，再断开。
+		sockets.at(-1)?.emit("data", ":mock 001 omp :welcome\r\n");
 		sockets.at(-1)?.emit("close");
 		expect(timers.delays.at(-1)).toBe(20);
 	});
@@ -218,7 +221,9 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		socket.emit("connect");
 		socket.emit("data", ":mock 001 omp :welcome\r\n");
 		expect(socket.writes.some(line => line.startsWith("PING "))).toBe(false);
-		expect(timers.delays).toEqual([]);
+		// `delays` 记录所有排过的定时器（含随后被 clear 的）：这里断言没有心跳/重连定时器，
+		// 只允许 connect 时武装、001 时清掉的注册超时。
+		expect(timers.delays.filter(delay => delay !== REGISTER_TIMEOUT_MS)).toEqual([]);
 	});
 
 	test("keepalive：静默 interval 后发 PING，任何入站行都撤销判死截止", () => {
@@ -236,12 +241,12 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		client.start();
 		socket.emit("connect");
 		socket.emit("data", ":mock 001 omp :welcome\r\n");
-		// 注册后才排第一次心跳；之前不排。
-		expect(timers.delays).toEqual([1_000]);
+		// 注册后才排第一次心跳；之前不排。REGISTER_TIMEOUT_MS 是 connect 时武装、001 时清掉的注册超时。
+		expect(timers.delays).toEqual([REGISTER_TIMEOUT_MS, 1_000]);
 
 		timers.runNext(); // 心跳到点：发 PING，并排下「判死 400」与「下一次 1000」
 		expect(socket.writes).toContain("PING :omp-1\r\n");
-		expect(timers.delays.slice(1)).toEqual([400, 1_000]);
+		expect(timers.delays.slice(2)).toEqual([400, 1_000]);
 
 		socket.emit("data", ":mock PONG mock :omp-1\r\n"); // 任何入站行都算活着
 		timers.runNext(); // 跑到下一次心跳（判死截止已被撤销，不会 destroy）
@@ -369,7 +374,7 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		first.emit("close"); // 迟到的 close
 		expect(client.status().registered).toBe(true);
 		expect(second.destroyCalls).toBe(0);
-		expect(timers.delays).toEqual([]); // 没有额外排一次重连
+		expect(timers.delays.filter(delay => delay !== REGISTER_TIMEOUT_MS)).toEqual([]); // 没有额外排一次重连
 		client.privmsg("alice", "still connected");
 		expect(second.writes).toContain("PRIVMSG alice :still connected\r\n");
 		expect(sockets).toHaveLength(2);

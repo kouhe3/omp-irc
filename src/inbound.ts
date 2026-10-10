@@ -12,7 +12,7 @@
  * 代价（有意取舍）：宿主对主会话不做任何代发，模型必须**显式**调用 `irc` 工具回话
  * ——所以注入正文末尾直接给出用法（见 {@link formatInboundBody}）。
  */
-import type { IrcInboundMessage } from "./client";
+import { nickEquals, type IrcInboundMessage } from "./client";
 import { type ConversationDirectory, type ConversationScope } from "./conversations";
 import { sanitizeSingleLine, type TranscriptEntry } from "./transcript";
 
@@ -80,6 +80,68 @@ export function formatInboundBody(event: {
 	return `${body}\n\n回复：irc 工具 {"action":"send","peer":"${event.id}","text":"<正文>"}`;
 }
 
+/**
+ * 入站鉴权策略（白/黑名单）。
+ *
+ * 两个维度各自独立：**私聊**按发送者 nick 判（`scope === "query"`），**频道**按频道名判
+ * （`scope === "channel"`）。语义（与 src/config.ts 的解析口径一致）：
+ * - **黑名单优先**：命中任一黑名单 → 拒收；
+ * - **该维度白名单非空即进入白名单模式**：未命中 → 拒收；白名单为空 → 放行（除黑名单命中）；
+ * - 匹配大小写不敏感：nick 走 RFC1459 casemapping（{@link nickEquals}，含 `[]{}\|~^` 折叠），
+ *   频道名比较前先小写（`#`/`&` 前缀必须显式写，config 侧负责补前缀）。
+ *
+ * 注意：nick 是可以被（尤其是敌对 ircd）伪造的，白名单不是密码学身份——见 README
+ *「接入公共 IRC 服务器的风险」。
+ */
+export interface InboundPolicy {
+	allowUsers: readonly string[];
+	blockUsers: readonly string[];
+	allowChannels: readonly string[];
+	blockChannels: readonly string[];
+}
+
+/** 缺省策略：四个数组都空 = 全放行（不因鉴权改变现状行为）。 */
+export const DEFAULT_INBOUND_POLICY: InboundPolicy = {
+	allowUsers: [],
+	blockUsers: [],
+	allowChannels: [],
+	blockChannels: [],
+};
+
+/** 判定用的入站事件（与会话目录的登记口径一致：query → 发送者 nick，channel → 频道名）。 */
+export interface InboundPolicyEvent {
+	scope: ConversationScope;
+	/** channel → 频道名（含 #/&）；query → 对方 nick。 */
+	targetId: string;
+	senderNick: string;
+}
+
+/** 被拒事件：{@link InboundPipelineOptions.onDenied} 的入参（id 是已登记/已落转录的会话 id）。 */
+export interface InboundDeniedEvent extends InboundPolicyEvent {
+	id: string;
+	/** 原始正文。 */
+	content: string;
+	notice?: boolean;
+}
+
+/**
+ * 该入站事件是否放行（纯函数，见 {@link InboundPolicy} 的语义）。把策略判定抽成纯函数，
+ * 便于配置侧与测试直接验证，不必搭整条管线。
+ */
+export function isInboundAllowed(policy: InboundPolicy, event: InboundPolicyEvent): boolean {
+	if (event.scope === "channel") {
+		const target = event.targetId.toLowerCase();
+		for (const blocked of policy.blockChannels) if (blocked.toLowerCase() === target) return false;
+		if (policy.allowChannels.length === 0) return true;
+		for (const allowed of policy.allowChannels) if (allowed.toLowerCase() === target) return true;
+		return false;
+	}
+	for (const blocked of policy.blockUsers) if (nickEquals(blocked, event.senderNick)) return false;
+	if (policy.allowUsers.length === 0) return true;
+	for (const allowed of policy.allowUsers) if (nickEquals(allowed, event.senderNick)) return true;
+	return false;
+}
+
 export interface InboundPipelineOptions {
 	conversations: ConversationDirectory;
 	transcripts: { record(id: string, entry: TranscriptEntry): void };
@@ -87,16 +149,25 @@ export interface InboundPipelineOptions {
 	deliver: (body: string) => void;
 	/** 我们自己的 nick（过滤自己的回声）。 */
 	selfNick: () => string;
+	/** 入站鉴权策略；缺省 = {@link DEFAULT_INBOUND_POLICY}（四个数组都空 = 全放行）。 */
+	policy?: InboundPolicy;
+	/** 被策略拒绝时的回调（消息已落转录，只是不注入）；index.ts 用它记一条 debug 日志。 */
+	onDenied?: (event: InboundDeniedEvent) => void;
 	now?: () => number;
 }
 
 /**
  * 入站消息 → 登记会话（首次即登记）→ 落转录 → 注入主会话卡片。
  * index.ts 与 e2e 共用这一条管线，测试跑的就是线上那条路径。
+ *
+ * 判定顺序：先 `ensure()` + `record()`（转录是**全量账本**，被拒的消息也留痕），
+ * 再按 {@link isInboundAllowed} 判定，被拒则回调 {@link InboundPipelineOptions.onDenied} 并
+ * **不**调用 `deliver`（不唤起 agent）。
  */
 export function createInboundHandler(options: InboundPipelineOptions): (message: IrcInboundMessage) => void {
+	const policy = options.policy ?? DEFAULT_INBOUND_POLICY;
 	return message => {
-		if (!message.text || message.from === options.selfNick()) return;
+		if (!message.text || nickEquals(message.from, options.selfNick())) return;
 		// 服务端/网关的 NOTICE（主机名带点，如 irc.example.org）不是对话，别进模型上下文。
 		if (message.notice && message.from.includes(".")) return;
 		const scope: ConversationScope = message.channel ? "channel" : "query";
@@ -105,6 +176,18 @@ export function createInboundHandler(options: InboundPipelineOptions): (message:
 		const record = options.conversations.ensure({ scope, targetId, timestamp: ts });
 		// 先落正文再注入：转录是**全量账本**（含出站长文被切分的多条），`irc log` 读它。
 		options.transcripts.record(record.id, { role: "user", text: message.text, ts, senderName: message.from });
+		// 白/黑名单鉴权：先落转录（上面）再判定，被拒只是不注入——账本保持全量。
+		if (!isInboundAllowed(policy, { scope, targetId, senderNick: message.from })) {
+			options.onDenied?.({
+				id: record.id,
+				scope,
+				targetId,
+				senderNick: message.from,
+				content: message.text,
+				notice: message.notice,
+			});
+			return;
+		}
 		options.deliver(
 			formatInboundBody({
 				id: record.id,

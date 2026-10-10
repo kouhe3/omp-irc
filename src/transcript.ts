@@ -15,15 +15,30 @@
  * 取舍：
  * - 单文件超过 {@link MAX_TRANSCRIPT_BYTES} 就轮转：保留最后 {@link KEEP_TRANSCRIPT_BYTES}
  *   字节内的完整行 + 重写 header（滚动窗口，磁盘与读取成本有界）。
+ * - 单条正文超过 {@link MAX_ENTRY_BYTES} 按 UTF-8 边界截断 + 标注：单条无界时「先查大小再写」的
+ *   轮转判断会被一条巨行绕过。
+ * - 目录级回收（{@link IrcTranscriptsOptions.limits}，默认 64 MiB / 500 文件）：`record()` 里节流
+ *   扫目录，超限按 mtime 最旧先删**整个会话文件**，保证长跑实例的转录总量有界。
  * - `tail()` 只从文件尾读一段，不做全量 `readFileSync`。
- * - 落盘**不截断、不切分、不改顺序**（全量账本），但入账前过 {@link sanitizeForLedger}：
+ * - 落盘**不切分、不改顺序**（全量账本；唯一的例外是单条超过 {@link MAX_ENTRY_BYTES} 的截断），
+ *   入账前过 {@link sanitizeForLedger}：
  *   剥掉终端控制序列、把「伪换行」压成空格。这份文件是宿主会直接渲染的目标
  *   （`omp render`、Agent Hub 的转录视图），把对端的 ESC/OSC 原样写进去等于给对端
  *   开了一条「正文 → 运维者终端」的通道；控制序列对账本的可读性也零价值。
  * - **显示**（卡片、digest、list、status）另过 {@link sanitizeSingleLine}，多一步 harness 标签转义。
  * - 文件名直接由会话 id 派生（会话 id 已收敛为 `[a-z0-9_-]`，天然是安全文件名）。
  */
-import { appendFileSync, mkdirSync, openSync, closeSync, readSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	mkdirSync,
+	openSync,
+	closeSync,
+	readSync,
+	readdirSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import * as path from "node:path";
 import type { IrcLogger } from "./config";
 
@@ -44,6 +59,57 @@ const MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
 const KEEP_TRANSCRIPT_BYTES = 512 * 1024;
 /** `tail()` 一次最多从文件尾读多少字节。 */
 const TAIL_READ_BYTES = 256 * 1024;
+
+/**
+ * 单条正文（含署名）上限：1 MiB，远高于任何 IRC 行（RFC1459 单行 ≤512 字节，出站长文在线上被切成多条）。
+ * 存在的理由是**让「文件大小检查在 append 之前」不能被一条巨行绕过**：`record()` 里先看大小再写真，
+ * 一次写入远大于 {@link MAX_TRANSCRIPT_BYTES} 的正文，轮转永远追不上（写完才发现超限）。超限按
+ * UTF-8 边界截断并加标注（见 {@link truncateUtf8}），不切碎多字节字符。
+ */
+const MAX_ENTRY_BYTES = 1 * 1024 * 1024;
+/** 单条被截断时追加的标注（只加一次，字节数从上限里预留，见 {@link truncateUtf8}）。 */
+const TRUNCATION_MARK = "…[已截断]";
+
+/** 转录目录总字节上限默认值：64 MiB。 */
+const DEFAULT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+/** 转录文件数上限默认值：500 个会话文件。 */
+const DEFAULT_MAX_FILES = 500;
+/** 目录级回收的节流间隔：`record()` 每 30 s 至多扫一次目录。 */
+const RECLAIM_INTERVAL_MS = 30_000;
+
+/** `record()` 里做目录级回收时用的上限（超限按 mtime 最旧先删）。 */
+export interface TranscriptLimits {
+	/** 转录目录总字节上限；默认 {@link DEFAULT_MAX_TOTAL_BYTES}。 */
+	maxBytes?: number;
+	/** `.jsonl` 文件数上限；默认 {@link DEFAULT_MAX_FILES}。 */
+	maxFiles?: number;
+}
+
+/** {@link IrcTranscripts} 的可注入项（测试用）。 */
+export interface IrcTranscriptsOptions {
+	limits?: TranscriptLimits;
+	/** 回收节流用的时钟；默认 `Date.now`。 */
+	now?: () => number;
+}
+
+/**
+ * 按 **UTF-8 字节**上限截断，且不切碎多字节字符（代理对按一个字符处理）。
+ * 超限时从上限里预留标注自身的字节，保证结果总长 ≤ `maxBytes`。
+ */
+function truncateUtf8(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	const budget = Math.max(0, maxBytes - Buffer.byteLength(TRUNCATION_MARK, "utf8"));
+	let bytes = 0;
+	let end = 0;
+	while (end < text.length) {
+		const code = text.codePointAt(end) ?? 0;
+		const size = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+		if (bytes + size > budget) break;
+		bytes += size;
+		end += code > 0xffff ? 2 : 1;
+	}
+	return text.slice(0, end) + TRUNCATION_MARK;
+}
 
 /** 生成短 id（宿主用 8 位十六进制；这里够区分即可）。 */
 function entryId(): string {
@@ -73,10 +139,21 @@ export class IrcTranscripts {
 	readonly #logger?: IrcLogger;
 	/** 会话 id → 上一条条目 id，用来串 parentId 链（进程内记忆，重启后退回 header id）。 */
 	readonly #lastEntry = new Map<string, string>();
+	/** 目录级回收上限（见 {@link IrcTranscripts.#reclaim}）。 */
+	readonly #limits: Required<TranscriptLimits>;
+	/** 回收节流用时钟（可注入，测试用）。 */
+	readonly #now: () => number;
+	/** 上次回收检查的时间戳；初值 -∞ 让第一次 `record()` 就检查一次。 */
+	#lastReclaim = Number.NEGATIVE_INFINITY;
 
-	constructor(dir: string, logger?: IrcLogger) {
+	constructor(dir: string, logger?: IrcLogger, options: IrcTranscriptsOptions = {}) {
 		this.#dir = dir;
 		this.#logger = logger;
+		this.#limits = {
+			maxBytes: options.limits?.maxBytes ?? DEFAULT_MAX_TOTAL_BYTES,
+			maxFiles: options.limits?.maxFiles ?? DEFAULT_MAX_FILES,
+		};
+		this.#now = options.now ?? Date.now;
 	}
 
 	/** 该会话的转录文件路径（`irc log` 与 `/irc log` 都读它）。 */
@@ -84,7 +161,10 @@ export class IrcTranscripts {
 		return path.join(this.#dir, `${conversationId}.jsonl`);
 	}
 
-	/** 追加一条；文件为空时先落 header；超过上限则先轮转。写失败只记日志。 */
+	/**
+	 * 追加一条；文件为空时先落 header；超过上限则先轮转；结尾做一次节流的目录级回收。
+	 * 写失败只记日志（收发不能因为转录失败而中断）。
+	 */
 	record(conversationId: string, entry: TranscriptEntry): void {
 		const file = this.pathFor(conversationId);
 		const ts = entry.ts ?? Date.now();
@@ -100,9 +180,14 @@ export class IrcTranscripts {
 			const id = entryId();
 			// 入账净化（见 sanitizeForLedger）：署名与正文都是 IRC 来的不可信输入，而这份文件
 			// 会被宿主渲染到终端上。
-			const text = entry.senderName
-				? `${sanitizeForLedger(entry.senderName)}: ${sanitizeForLedger(entry.text)}`
-				: sanitizeForLedger(entry.text);
+			// 再按 MAX_ENTRY_BYTES 截断（署名与正文合一后算）：单条无界时上面的文件大小检查
+			// 追不上写入（写完才发现超限），一张巨卡片/一条巨行就能把账本撑到任意大小。
+			const text = truncateUtf8(
+				entry.senderName
+					? `${sanitizeForLedger(entry.senderName)}: ${sanitizeForLedger(entry.text)}`
+					: sanitizeForLedger(entry.text),
+				MAX_ENTRY_BYTES,
+			);
 			const message =
 				entry.role === "user"
 					? { role: "user", content: [{ type: "text", text }], attribution: "user", timestamp: ts }
@@ -134,6 +219,8 @@ export class IrcTranscripts {
 				{ encoding: "utf8", mode: 0o600 },
 			);
 			this.#lastEntry.set(conversationId, id);
+			// 目录级回收（节流，见 #reclaim）：转录总量与文件数有界，长跑实例不会把磁盘写满。
+			this.#reclaim(conversationId);
 		} catch (error) {
 			// 落盘失败不影响收发；但必须留下线索，否则会跟「真没消息」混淆。
 			this.#logger?.warn("IRC 转录写入失败", {
@@ -208,6 +295,60 @@ export class IrcTranscripts {
 		return Bun.file(file).size;
 	}
 
+	/**
+	 * 目录级回收：`record()` 里**节流**调用（每 {@link RECLAIM_INTERVAL_MS} 至多一次，避免每条消息都扫目录）。
+	 * 超过 {@link TranscriptLimits} 就按 **mtime 最旧优先**删整个会话文件，直到总量与文件数都回到上限内。
+	 *
+	 * 两条硬约束：
+	 * - **不删当前正在写的这一个文件**（刚 append 完，删了等于消息凭空消失）。
+	 * - 删掉别的会话后同步 `#lastEntry`：那条 parentId 链的锚点已经不在盘上了，下次写要从 header 重接。
+	 *
+	 * 回收是纯清理动作，任何失败只记日志（含目录还不存在），绝不影响收发。
+	 */
+	#reclaim(current: string): void {
+		const now = this.#now();
+		if (now - this.#lastReclaim < RECLAIM_INTERVAL_MS) return;
+		this.#lastReclaim = now;
+		try {
+			const currentFile = path.basename(this.pathFor(current));
+			const files: { name: string; size: number; mtime: number }[] = [];
+			let total = 0;
+			for (const name of readdirSync(this.#dir)) {
+				if (!name.endsWith(".jsonl")) continue;
+				// 目录里可能有正在被别的进程删的文件：缺了就当没看见。
+				const info = statSync(path.join(this.#dir, name), { throwIfNoEntry: false });
+				if (!info?.isFile()) continue;
+				files.push({ name, size: info.size, mtime: info.mtimeMs });
+				total += info.size;
+			}
+			if (files.length <= this.#limits.maxFiles && total <= this.#limits.maxBytes) return;
+			// mtime 越小越旧；同一毫秒（同批创建）时按文件名定序，保证行为可复现。
+			files.sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
+			let count = files.length;
+			for (const file of files) {
+				if (count <= this.#limits.maxFiles && total <= this.#limits.maxBytes) break;
+				if (file.name === currentFile) continue;
+				try {
+					unlinkSync(path.join(this.#dir, file.name));
+					count--;
+					total -= file.size;
+					this.#lastEntry.delete(file.name.slice(0, -".jsonl".length));
+					this.#logger?.debug?.("IRC 转录回收：删除最旧的会话文件", { file: file.name, bytes: file.size });
+				} catch (error) {
+					this.#logger?.warn("IRC 转录回收删除失败", {
+						file: file.name,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		} catch (error) {
+			this.#logger?.warn("IRC 转录回收失败", {
+				dir: this.#dir,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	/** 超过上限：保留尾部完整行 + 重写 header（滚动窗口）。 */
 	#rotate(file: string, conversationId: string, ts: number): void {
 		const size = this.#size(file);
@@ -215,13 +356,19 @@ export class IrcTranscripts {
 		const length = size - offset;
 		const buffer = Buffer.allocUnsafe(length);
 		const handle = openSync(file, "r");
+		let bytesRead = 0;
 		try {
-			readSync(handle, buffer, 0, length, offset);
+			// 短读是可能的（文件被并发删除/截断，或读到 EOF 之前就返回）：**只认真正读到的字节**。
+			// 丢掉 bytesRead 就会把 `allocUnsafe` 的未初始化内存（可能是别的进程/会话的残留数据，
+			// 也可能是 NUL）写进账本——账本是要给宿主渲染的，等于往里面注入任意字节。
+			bytesRead = readSync(handle, buffer, 0, length, offset);
 		} finally {
 			closeSync(handle);
 		}
-		let keep = buffer.toString("utf8");
-		keep = keep.slice(keep.indexOf("\n") + 1);
+		// subarray(0, bytesRead) 保证只碰真实读到的字节；半行由下面的 indexOf("\n") 丢掉
+		// （找不到 \n 时 indexOf 为 -1，slice(0) 保留全部，与旧行为一致）。
+		let keep = buffer.subarray(0, bytesRead).toString("utf8");
+		if (offset > 0) keep = keep.slice(keep.indexOf("\n") + 1);
 		writeFileSync(file, headerLine(conversationId, this.#dir, ts) + keep, { encoding: "utf8", mode: 0o600 });
 		this.#lastEntry.delete(conversationId);
 	}
@@ -238,7 +385,21 @@ export interface TranscriptDigestOptions {
 export const DEFAULT_DIGEST: TranscriptDigestOptions = { perEntry: 2_000, total: 6_000 };
 
 /**
- * 终端显示的净化：IRC 消息是**不可信输入**（对方可以用 ESC/OSC 序列操纵运维者的终端）。
+ * 不可见格式字符（Cf）：`\p{Bidi_Control}`（U+061C ALM、U+200E/200F LRM/RLM、U+202A-202E
+ * LRE/RLE/PDF/LRO/RLO、U+2066-2069 LRI/RLI/FSI/PDI，即 Trojan Source 那类**双向重排**控制）
+ * 加三个同样不可见、对正文零价值的字符：U+200B（ZWSP）、U+FEFF（BOM/零宽不换行空格）、
+ * U+00AD（软连字符，能被渲染成连字符来伪装 URL/域名）。
+ *
+ * 为什么**不是**剥掉整个 `\p{Cf}`：U+200C（ZWNJ）与 U+200D（ZWJ）也在 Cf 里，但它们是
+ * emoji ZWJ 序列（👨‍👩‍👧）与印度语系连字（क्‌ष）必需的**字形连接符**——剥掉会把正文里的
+ * 可见字形拆坏（多出一个孤立字符），而它们本身**不是双向控制字符**，不给对端任何视觉重排
+ * 能力（ZWNJ/ZWJ 只影响相邻字形的连接，不改变字符顺序）。所以这里按「能力」而不是按
+ * Unicode 类别划界：能重排/隐藏视觉的一律剥，纯粹连接字形的保留。
+ */
+const INVISIBLE_FORMAT = /[\u00ad\u200b\ufeff\p{Bidi_Control}]/u;
+
+/**
+ * 终端显示的净化：IRC 消息是**不可信输入**（对方可以用 ESC/OSC 序列、双向控制字符操纵运维者的终端）。
  * 这是最底层的一道（显示与落盘两层都建在它上面）：{@link sanitizeForLedger} 用它剥控制序列，
  * {@link sanitizeForDisplay} 再叠 harness 标签转义。
  */
@@ -288,6 +449,9 @@ export function stripControl(text: string): string {
 			out += "\n";
 			continue;
 		}
+		// 不可见格式字符（见 INVISIBLE_FORMAT）：正文里没有任何可见信息，但能操纵渲染顺序
+		// 或藏起混淆字符，一律剥掉。注意 U+200C/U+200D **不**在这个集合里（emoji/连字要用）。
+		if (INVISIBLE_FORMAT.test(text[index] ?? "")) continue;
 		// C0（保留 \n \t）、DEL、C1（含单字节 CSI）剥掉。
 		if (code === 0x0a || code === 0x09) out += text[index];
 		else if (code >= 0x20 && code !== 0x7f && !(code >= 0x80 && code <= 0x9f)) out += text[index];
@@ -313,7 +477,12 @@ export function escapeHarnessTags(text: string): string {
 
 /**
  * 不可信输入 → 要显示给终端或送进模型上下文的文本：剥控制序列 + 转义 harness 标签。
- * **显示/注入边界**必须走这里（落盘走 {@link sanitizeForLedger}，不转义 harness 标签）。
+ *
+ * ⚠️ **本函数不做单行化**：换行原样保留（含对端用 U+2028/U+2029 造出的伪换行，见 {@link stripControl}）。
+ * 因此「一行 = 一条 IRC 消息」的显示/注入出口（卡片、日志、工具结果、digest）**不能直接用它**——
+ * 那些地方一律走 {@link sanitizeSingleLine}（= 本函数 + 行终止符压成空格），否则对端能在自己正文里
+ * 凭空多造一行来伪造别人（例如 `[omp] …`）的发言。落盘走 {@link sanitizeForLedger}
+ * （同样剥控制序列 + 压掉伪换行，但不转义 harness 标签）。
  */
 export function sanitizeForDisplay(text: string): string {
 	return escapeHarnessTags(stripControl(text));

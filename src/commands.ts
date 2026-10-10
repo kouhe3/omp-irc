@@ -12,6 +12,7 @@ import {
 	type ConversationDirectory,
 	type ConversationRecord,
 } from "./conversations";
+import { assertIrcTarget } from "./outbound";
 import { formatTranscriptDigest, sanitizeSingleLine, type TranscriptEntry } from "./transcript";
 
 export const IRC_HELP = [
@@ -174,7 +175,7 @@ export async function runIrcCommand(deps: IrcCommandDeps, args: string): Promise
 				};
 			}
 			case "log": {
-				// 末尾的纯数字 token 当条数，其余当作会话引用（显示名里可以有空格）。
+				// 末尾的纯数字 token 当条数，其余当作会话引用（id / nick / 频道名；displayName 不是引用）。
 				const last = rest[rest.length - 1];
 				const tailArgs = last !== undefined && /^\d+$/.test(last) ? rest.slice(0, -1) : rest;
 				const reference = tailArgs.join(" ").trim();
@@ -201,6 +202,8 @@ export async function runIrcCommand(deps: IrcCommandDeps, args: string): Promise
 				if (!reference) return { text: "用法：/irc send <peer|nick|频道> <正文>", level: "warning" };
 				const body = known?.body ?? raw?.body ?? "";
 				if (!body) return { text: `用法：/irc send ${reference} <正文>`, level: "warning" };
+				// 非法引用（含空格/逗号/超长/前导冒号）当场拒绝：别先登记一条幽灵会话再让出站层抛错。
+				assertIrcTarget(reference);
 				// 先查连接再登记：未注册时直接拒绝，不留下幽灵会话。
 				if (!deps.client.status().registered) {
 					return { text: "IRC 未连接/未注册，消息未发出（/irc status 看原因）", level: "warning" };

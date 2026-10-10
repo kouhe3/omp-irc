@@ -10,6 +10,9 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
+// 只借类型：`import type` 在 verbatimModuleSyntax 下被完全擦除，运行期没有 config → inbound
+// 的依赖边（inbound 会 import client，避免 config → client 的环）。
+import type { InboundPolicy } from "./inbound";
 
 /**
  * 扩展自己用的最小日志面，避免核心模块依赖宿主 `pi.logger` 的具体类型。
@@ -45,10 +48,16 @@ export interface IrcConfig {
 	password?: string;
 	/** 每个会话的 jsonl 转录落脚目录。 */
 	transcriptDir: string;
+	/** 转录目录总字节上限（超出按 mtime 删最旧）。缺省由 `IrcTranscripts` 决定（64 MiB）。 */
+	transcriptMaxBytes?: number;
+	/** 转录目录文件数上限（超出按 mtime 删最旧）。缺省由 `IrcTranscripts` 决定（500）。 */
+	transcriptMaxFiles?: number;
 	/** 心跳间隔（秒）：>0 启用（静默这么久就发 `PING`）；0 = 关闭。缺省 60。 */
 	keepaliveSeconds: number;
 	/** 发出 `PING` 后多久没有任何入站行就判定连接已死（秒）。缺省 30：这只是等一个 PONG 的预算，与间隔无关。 */
 	keepaliveTimeoutSeconds?: number;
+	/** 入站白/黑名单鉴权策略（见 README「入站鉴权（白/黑名单）」）；四个数组都空 = 全放行。 */
+	inboundPolicy: InboundPolicy;
 	configPath: string;
 	/** 能连 server 的前提：server + nick 齐备。 */
 	configured: boolean;
@@ -70,8 +79,14 @@ interface EnvOverrides {
 	channels?: string[];
 	password?: string;
 	transcriptDir?: string;
+	transcriptMaxBytes?: number;
+	transcriptMaxFiles?: number;
 	keepaliveSeconds?: number;
 	keepaliveTimeoutSeconds?: number;
+	allowUsers?: string[];
+	blockUsers?: string[];
+	allowChannels?: string[];
+	blockChannels?: string[];
 }
 
 const CONFIG_FILENAME = "irc.json";
@@ -118,6 +133,13 @@ function asKeepaliveSeconds(value: unknown): number | undefined {
 	return raw;
 }
 
+/** 正整数（转录回收上限用）：不给上界，字节数/文件数都可以很大，只要 > 0 且是整数。 */
+function asPositiveInt(value: unknown): number | undefined {
+	const raw = typeof value === "number" ? value : asString(value) === undefined ? undefined : Number(asString(value));
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) return undefined;
+	return raw;
+}
+
 /** 逗号分隔字符串（env）或数组（文件）都接受，返回频道列表。 */
 function parseChannels(value: unknown): string[] | undefined {
 	if (Array.isArray(value)) {
@@ -129,6 +151,34 @@ function parseChannels(value: unknown): string[] | undefined {
 		.split(",")
 		.map(entry => entry.trim())
 		.filter(Boolean);
+}
+
+/**
+ * 白/黑名单：接受字符串数组（文件）或逗号分隔字符串（env），trim、丢空项。
+ * `kind` 决定归一口径：`channel` 没写 #/& 前缀就当 `#频道`（同 `client.normalizeChannel`，
+ * 这里自实现以避免 config → client 的依赖边）；`nick` 只 trim（RFC1459 casemapping 的折叠
+ * 留给比较时的 `nickEquals`）。类型非法（数字/布尔/对象…）→ undefined 并写一条 notes。
+ */
+function parsePolicyList(
+	value: unknown,
+	kind: "nick" | "channel",
+	notes: string[],
+	label: string,
+): string[] | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "string" && !Array.isArray(value)) {
+		notes.push(`${label} 值非法（应为字符串数组或逗号分隔字符串），已忽略`);
+		return undefined;
+	}
+	const entries: unknown[] = typeof value === "string" ? value.split(",") : value;
+	const out: string[] = [];
+	for (const entry of entries) {
+		if (typeof entry !== "string") continue;
+		const name = entry.trim();
+		if (!name) continue;
+		out.push(kind === "channel" && !name.startsWith("#") && !name.startsWith("&") ? `#${name}` : name);
+	}
+	return out;
 }
 
 /**
@@ -203,8 +253,14 @@ interface ConfigFile {
 	channels?: unknown;
 	password?: unknown;
 	transcriptDir?: unknown;
+	transcriptMaxBytes?: unknown;
+	transcriptMaxFiles?: unknown;
 	keepaliveSeconds?: unknown;
 	keepaliveTimeoutSeconds?: unknown;
+	allowUsers?: unknown;
+	blockUsers?: unknown;
+	allowChannels?: unknown;
+	blockChannels?: unknown;
 }
 
 function readConfigFile(filePath: string, notes: string[]): ConfigFile {
@@ -253,8 +309,14 @@ function readEnv(env: Record<string, string | undefined>, notes: string[]): EnvO
 	take("channels", env.IRC_CHANNELS, parseChannels);
 	take("password", env.IRC_PASSWORD, asString as (v: string) => string | undefined);
 	take("transcriptDir", env.IRC_TRANSCRIPT_DIR, asString as (v: string) => string | undefined);
+	take("transcriptMaxBytes", env.IRC_TRANSCRIPT_MAX_BYTES, asPositiveInt as (v: string) => number | undefined);
+	take("transcriptMaxFiles", env.IRC_TRANSCRIPT_MAX_FILES, asPositiveInt as (v: string) => number | undefined);
 	take("keepaliveSeconds", env.IRC_KEEPALIVE_SECONDS, asKeepaliveSeconds as (v: string) => number | undefined);
 	take("keepaliveTimeoutSeconds", env.IRC_KEEPALIVE_TIMEOUT_SECONDS, asSeconds as (v: string) => number | undefined);
+	take("allowUsers", env.IRC_ALLOW_USERS, v => parsePolicyList(v, "nick", notes, envName("allowUsers")));
+	take("blockUsers", env.IRC_BLOCK_USERS, v => parsePolicyList(v, "nick", notes, envName("blockUsers")));
+	take("allowChannels", env.IRC_ALLOW_CHANNELS, v => parsePolicyList(v, "channel", notes, envName("allowChannels")));
+	take("blockChannels", env.IRC_BLOCK_CHANNELS, v => parsePolicyList(v, "channel", notes, envName("blockChannels")));
 	// 不走 take：空串对 nickSuffix 有语义（关闭后缀），而 take 把空串当「未设置」跳过。
 	if (env.IRC_NICK_SUFFIX !== undefined) {
 		const parsed = parseNickSuffix(env.IRC_NICK_SUFFIX);
@@ -304,10 +366,21 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 	const nick = nickSuffix ? `${baseNick}-${nickSuffix}` : baseNick;
 	const channels = overrides.channels ?? parseChannels(file.channels) ?? [];
 	const transcriptDir = overrides.transcriptDir ?? asString(file.transcriptDir) ?? path.join(agentDir, "irc-transcripts");
+	// 转录回收上限：只在显式配置时覆盖 `IrcTranscripts` 的缺省（64 MiB / 500 文件），
+	// 免得「默认值」在两个文件里各写一份、日后漂移。
+	const transcriptMaxBytes = overrides.transcriptMaxBytes ?? asPositiveInt(file.transcriptMaxBytes);
+	const transcriptMaxFiles = overrides.transcriptMaxFiles ?? asPositiveInt(file.transcriptMaxFiles);
 	const keepaliveSeconds =
 		overrides.keepaliveSeconds ?? asKeepaliveSeconds(file.keepaliveSeconds) ?? DEFAULT_KEEPALIVE_SECONDS;
 	const keepaliveTimeoutSeconds =
 		overrides.keepaliveTimeoutSeconds ?? asSeconds(file.keepaliveTimeoutSeconds) ?? DEFAULT_KEEPALIVE_TIMEOUT_SECONDS;
+	// 白/黑名单：env 同名键覆盖文件；两侧都接受「字符串数组或逗号分隔字符串」（文件用数组更像话）。
+	const inboundPolicy: InboundPolicy = {
+		allowUsers: overrides.allowUsers ?? parsePolicyList(file.allowUsers, "nick", notes, "allowUsers") ?? [],
+		blockUsers: overrides.blockUsers ?? parsePolicyList(file.blockUsers, "nick", notes, "blockUsers") ?? [],
+		allowChannels: overrides.allowChannels ?? parsePolicyList(file.allowChannels, "channel", notes, "allowChannels") ?? [],
+		blockChannels: overrides.blockChannels ?? parsePolicyList(file.blockChannels, "channel", notes, "blockChannels") ?? [],
+	};
 
 	const config: IrcConfig = {
 		server,
@@ -317,8 +390,11 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 		channels,
 		password: overrides.password ?? asString(file.password),
 		transcriptDir,
+		transcriptMaxBytes,
+		transcriptMaxFiles,
 		keepaliveSeconds,
 		keepaliveTimeoutSeconds,
+		inboundPolicy,
 		configPath: configFile,
 		configured: Boolean(server),
 	};
@@ -349,6 +425,14 @@ export function loadConfig(agentDir: string, options: IrcConfigOptions = {}): Ir
 		);
 	}
 	if (config.password) notes.push("已配置连接密码（PASS；SASL 不支持）");
+	notes.push(
+		`入站策略：私聊白名单 ${inboundPolicy.allowUsers.length} / 黑名单 ${inboundPolicy.blockUsers.length}；频道白名单 ${inboundPolicy.allowChannels.length} / 黑名单 ${inboundPolicy.blockChannels.length}（未配白名单的维度放行）`,
+	);
+	if (transcriptMaxBytes !== undefined || transcriptMaxFiles !== undefined) {
+		const bytes = transcriptMaxBytes === undefined ? "默认 64 MiB" : `${Math.round(transcriptMaxBytes / 1024 / 1024)} MiB`;
+		const files = transcriptMaxFiles === undefined ? "默认 500 文件" : `${transcriptMaxFiles} 文件`;
+		notes.push(`转录上限：${bytes} / ${files}（超出按 mtime 删最旧）`);
+	}
 
 	return { config, notes };
 }

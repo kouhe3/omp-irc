@@ -112,6 +112,23 @@ describe("encodeConversationId", () => {
 		expect(encodeConversationId("query", "a b")).toMatch(/^irc-a-b~[0-9a-f]{16}$/);
 	});
 
+	test("未 trim 的原始串参与无损判定：`aaa` 与 `aaa ` 必须是不同 id（trim 只用于算 base）", () => {
+		// 回归：无损判定曾在 `raw = targetId.trim()` 之后做，于是 `aaa` 与 `aaa ` 收敛成同一个
+		// `irc-aaa`——文档承诺的「id 只指向一个目标」就不成立了（句柄不再单射）。
+		const plain = encodeConversationId("query", "aaa");
+		const trailing = encodeConversationId("query", "aaa ");
+		expect(plain).toBe("irc-aaa");
+		expect(trailing).toMatch(/^irc-aaa~[0-9a-f]{16}$/);
+		expect(trailing).not.toBe(plain);
+		// 哈希吃的是**未 trim** 的原始串：不同空白变体也互不相同（前导同理）。
+		expect(encodeConversationId("query", " aaa")).not.toBe(trailing);
+		expect(encodeConversationId("query", "aaa  ")).not.toBe(trailing);
+		// 频道同理：带尾随空白的「频道」不与其 trim 版本同形。
+		expect(encodeConversationId("channel", "#omp")).toBe("irc-chan-~homp");
+		expect(encodeConversationId("channel", "#omp ")).toMatch(/^irc-chan-~homp~[0-9a-f]{16}$/);
+		expect(encodeConversationId("channel", "#omp ")).not.toBe(encodeConversationId("channel", "#omp"));
+	});
+
 	test("频道：有损的 # 频道带哈希；无 #/& 前缀的「频道」一律带哈希", () => {
 		expect(encodeConversationId("channel", "#omp[1]")).toMatch(/^irc-chan-~homp-1-~[0-9a-f]{16}$/);
 		expect(encodeConversationId("channel", "omp")).toMatch(/^irc-chan-omp~[0-9a-f]{16}$/);
@@ -376,12 +393,30 @@ describe("ConversationDirectory", () => {
 		expect(dir.resolve("BOT[1]")?.id).toBe(bracket.id);
 	});
 
-	test("resolve 支持 id / 原始 nick / 显示名，且大小写不敏感", () => {
+	test("id 单射（目录层）：`aaa` 与 `aaa ` 是两条记录，各自的句柄只指向自己", () => {
+		const dir = new ConversationDirectory({ limit: 10 });
+		const plain = dir.ensure({ scope: "query", targetId: "aaa", timestamp: 1 });
+		const padded = dir.ensure({ scope: "query", targetId: "aaa ", timestamp: 2 });
+		expect(plain.id).toBe("irc-aaa");
+		expect(padded.id).toMatch(/^irc-aaa~[0-9a-f]{16}$/);
+		expect(dir.list()).toHaveLength(2);
+		expect(dir.resolve("irc-aaa")).toBe(plain);
+		expect(dir.resolve(padded.id)).toBe(padded);
+		expect(dir.resolve("aaa")).toBe(plain);
+		// 引用两侧空白会被 trim，所以带空白的引用归到 `aaa` 那条；带空白的 targetId 本身只能靠 id 命中。
+		expect(dir.resolve("aaa ")).toBe(plain);
+	});
+
+	test("resolve 支持 id / 原始 nick，且大小写不敏感（显示名不再是引用）", () => {
 		const dir = new ConversationDirectory({ limit: 10 });
 		dir.ensure({ scope: "query", targetId: "Alice", timestamp: 1 });
+		dir.ensure({ scope: "channel", targetId: "#omp", timestamp: 2 });
 		expect(dir.resolve("IRC-ALICE")?.id).toBe("irc-alice");
 		expect(dir.resolve("alice")?.id).toBe("irc-alice");
-		expect(dir.resolve("irc私聊 alice")?.id).toBe("irc-alice");
+		expect(dir.resolve("#OMP")?.id).toBe("irc-chan-~homp");
+		// displayName 只存进 record，不是引用：回退分支已删（它曾让「IRC私聊 alice」也命中）。
+		expect(dir.resolve("irc私聊 alice")).toBeUndefined();
+		expect(dir.resolve("IRC频道 #omp")).toBeUndefined();
 		expect(dir.resolve("  ")).toBeUndefined();
 		expect(dir.resolve("nobody")).toBeUndefined();
 	});

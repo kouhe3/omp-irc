@@ -21,6 +21,21 @@ import type { IrcLogger } from "./config";
 /** IRC 行（含 CRLF 前）的字节上限，RFC1459 §2.3。 */
 export const MAX_IRC_BYTES = 512;
 
+/**
+ * 单条入站行（已按 `\n` 切出的那一行）的字节上限：超长行直接丢弃，别喂给解析器，
+ * 避免对端用一行灌爆内存/上下文。
+ */
+export const MAX_INBOUND_LINE_BYTES = 8 * 1024;
+
+/**
+ * 入站分帧缓冲（尚无 `\n` 的残留）的字节上限：连上这么久都没切出完整一行，说明对端在
+ * 灌无边界数据 → 判错并断开（走既有 close → 退避重连），不让缓冲无界增长。
+ */
+export const MAX_INBOUND_BUFFER_BYTES = 64 * 1024;
+
+/** TCP 连上后等待 001（RPL_WELCOME）的注册超时（毫秒）；超时按连接失败处理并断开重连。 */
+export const REGISTER_TIMEOUT_MS = 15_000;
+
 /** 客户端实际用到的 socket 面（net.Socket / tls.TLSSocket 都满足，工厂里做一次断言）。 */
 export interface IrcSocket {
 	write(data: string): boolean;
@@ -173,6 +188,43 @@ export function prefixNick(prefix: string | undefined): string {
 	return cut === -1 ? prefix : prefix.slice(0, cut);
 }
 
+/** RFC1459 §2.2 casemapping 的等价字符：`{}|~` 分别折到 `[]\^`（再统一小写）。 */
+const RFC1459_FOLD: Record<string, string> = { "{": "[", "}": "]", "|": "\\", "~": "^" };
+
+function foldNick(nick: string): string {
+	let folded = "";
+	for (const char of nick.toLowerCase()) folded += RFC1459_FOLD[char] ?? char;
+	return folded;
+}
+
+/**
+ * RFC1459 casemapping 下的 nick 相等（大小写 + `[]{}|~^` 折叠）。
+ * 服务端与其它客户端都可以按这套映射写同一个身份（`omp` / `OMP` / `omp[]`），精确比较会漏判。
+ */
+export function nickEquals(a: string, b: string): boolean {
+	return foldNick(a) === foldNick(b);
+}
+
+/** RFC1459 §2.3.1 nick 首字符：字母或 `[]\`_^{|}`。 */
+const NICK_FIRST = /[A-Za-z\[\]\\`_^{|}]/;
+/** 首字符之后：字母、数字、`-`、`[]\`_^{|}`。 */
+const NICK_REST = /[A-Za-z0-9\[\]\\`_^{|}-]/;
+/** 服务端可控 nick 的长度上限（RFC 是 9，这里放宽容错但仍封顶，避免被塞一长串）。 */
+const MAX_SERVER_NICK_LENGTH = 30;
+
+/**
+ * 服务端给的 nick 是否合法（001 的第一参数、433 的第二参数、NICK 的新 nick）。
+ * 不合法就不收下：这些值会流进 `NICK`/`USER`/`payloadBudget`/身份比较，不能是任意串。
+ */
+export function isValidServerNick(nick: string): boolean {
+	if (!nick || nick.length > MAX_SERVER_NICK_LENGTH) return false;
+	if (!NICK_FIRST.test(nick[0] as string)) return false;
+	for (let index = 1; index < nick.length; index++) {
+		if (!NICK_REST.test(nick[index] as string)) return false;
+	}
+	return true;
+}
+
 /** 一行 `:nick!user@host PRIVMSG target :` + CRLF 的字节上界（host 按 63 字节上限估）。 */
 export function payloadBudget(kind: "PRIVMSG" | "NOTICE", nick: string, user: string, target: string): number {
 	const overhead =
@@ -250,11 +302,15 @@ export class IrcClient {
 	#nick: string;
 	#socket?: IrcSocket;
 	#buffer = "";
+	/** 本连接是否已就「入站行超长」告警过（每条连接只 warn 一次，避免刷屏）。 */
+	#lineWarned = false;
 	#connected = false;
 	#registered = false;
 	#running = false;
 	#attempts = 0;
 	#reconnectTimer?: unknown;
+	/** 注册超时定时器（TCP connect 后武装，001/close 清掉）。 */
+	#registerTimer?: unknown;
 	#keepalive?: { intervalMs: number; timeoutMs: number };
 	/** 下一次发 PING 的定时器。 */
 	#keepaliveTimer?: unknown;
@@ -307,9 +363,11 @@ export class IrcClient {
 			this.#reconnectTimer = undefined;
 		}
 		this.#clearKeepalive();
+		this.#clearRegisterTimeout();
 		const socket = this.#socket;
 		this.#socket = undefined;
 		this.#buffer = "";
+		this.#lineWarned = false;
 		this.#connected = false;
 		this.#registered = false;
 		if (socket) {
@@ -397,14 +455,16 @@ export class IrcClient {
 		}
 		this.#socket = socket;
 		this.#buffer = "";
+		this.#lineWarned = false;
 		// 所有事件都按 socket 身份守卫：`destroy()` 的 close 是异步到达的，旧 socket 的 close 若在
 		// 新连接建立之后才到（`/irc disconnect` 紧跟 `/irc connect`），未加守卫就会把新连接的
 		// 句柄与状态覆盖掉（新连接被孤立：写不出去，还会多连一条）。
 		socket.on("connect", () => {
 			if (this.#socket !== socket) return;
 			this.#connected = true;
-			this.#attempts = 0;
 			this.register();
+			// 「TCP 连上」不算可用：退避重置要等 001，注册超时也在这里武装。
+			this.#armRegisterTimeout();
 		});
 		socket.on("data", chunk => {
 			if (this.#socket !== socket) return;
@@ -424,13 +484,38 @@ export class IrcClient {
 		const wasConnected = this.#connected;
 		this.#socket = undefined;
 		this.#buffer = "";
+		this.#lineWarned = false;
 		this.#connected = false;
 		this.#registered = false;
+		this.#clearRegisterTimeout();
 		this.#clearKeepalive();
 		if (!this.#running) return;
 		this.#logger?.warn("IRC 连接断开", { host: this.#host, port: this.#port, connected: wasConnected });
 		this.onDisconnect?.();
 		this.#scheduleReconnect();
+	}
+
+	/** TCP connect 后武装注册超时；001 或 close 都会清掉。 */
+	#armRegisterTimeout(): void {
+		this.#clearRegisterTimeout();
+		if (!this.#running) return;
+		this.#registerTimer = this.#timers.setTimeout(() => this.#onRegisterTimeout(), REGISTER_TIMEOUT_MS);
+	}
+
+	#clearRegisterTimeout(): void {
+		if (this.#registerTimer === undefined) return;
+		this.#timers.clearTimeout(this.#registerTimer);
+		this.#registerTimer = undefined;
+	}
+
+	/** 连上后一直没等到 001：对端可能只接受连接不完成握手，断开交给既有重连路径。 */
+	#onRegisterTimeout(): void {
+		this.#registerTimer = undefined;
+		if (!this.#running || !this.#connected || this.#registered) return;
+		const error = new Error(`IRC 注册超时（${REGISTER_TIMEOUT_MS}ms 内未收到 001）`);
+		this.#logger?.warn("IRC 注册超时，断开重连", { host: this.#host, port: this.#port });
+		this.#emitError(error);
+		this.#socket?.destroy();
 	}
 
 	/** 注册成功后开始心跳；`keepalive` 未配置时是 no-op。 */
@@ -510,12 +595,29 @@ export class IrcClient {
 		while (index !== -1) {
 			const line = this.#buffer.slice(0, index).replace(/\r$/, "");
 			this.#buffer = this.#buffer.slice(index + 1);
-			if (line.trim()) {
+			if (Buffer.byteLength(line, "utf8") > MAX_INBOUND_LINE_BYTES) {
+				// 超长行直接丢弃（不喂解析器、不进上下文），每条连接只 warn 一次避免刷屏。
+				this.#noteInbound();
+				if (!this.#lineWarned) {
+					this.#lineWarned = true;
+					this.#logger?.warn("IRC 入站行超长，已丢弃", { limit: MAX_INBOUND_LINE_BYTES });
+				}
+			} else if (line.trim()) {
 				// 任何入站行（含服务端自己的 PING）都证明连接活着：撤掉未决心跳。
 				this.#noteInbound();
 				this.#handle(line);
 			}
 			index = this.#buffer.indexOf("\n");
+		}
+		// 循环结束时缓冲里已没有 `\n`：还超过上限说明对端在灌无边界数据 → 判错并断开
+		// （destroy → close → 退避重连），不让缓冲无界增长。
+		if (Buffer.byteLength(this.#buffer, "utf8") > MAX_INBOUND_BUFFER_BYTES) {
+			const socket = this.#socket;
+			this.#buffer = "";
+			this.#emitError(
+				new Error(`IRC 入站缓冲超过 ${MAX_INBOUND_BUFFER_BYTES} 字节（无完整行），断开连接`),
+			);
+			socket?.destroy();
 		}
 	}
 
@@ -527,10 +629,18 @@ export class IrcClient {
 				return;
 			}
 			case "001": {
-				// 服务端给的最终 nick 以 001 的第一个参数为准（433 自愈后我们也会用本地值）。
+				// 服务端给的最终 nick 以 001 的第一个参数为准（433 自愈后我们也会用本地值）——
+				// 但这是服务端可控值，必须校验后才收下。
 				const welcome = params[0];
-				if (welcome) this.#nick = welcome;
+				if (welcome && !isValidServerNick(welcome)) {
+					this.#logger?.warn("IRC 001 里的 nick 不合法，保留本地 nick", { nick: welcome });
+				} else if (welcome) {
+					this.#nick = welcome;
+				}
 				this.#registered = true;
+				// 注册成功才算连接可用：清掉注册超时，退避归零。
+				this.#clearRegisterTimeout();
+				this.#attempts = 0;
 				this.#logger?.info("IRC 已注册", { nick: this.#nick });
 				this.onRegistered?.();
 				this.#armKeepalive();
@@ -539,11 +649,29 @@ export class IrcClient {
 				return;
 			}
 			case "433": {
-				// ERR_NICKNAMEINUSE：换名重试（RFC 建议加下划线）。
+				// ERR_NICKNAMEINUSE：换名重试（RFC 建议加下划线）。params[1] 同样是服务端可控值，
+				// 合法才拿它做基名，否则退回本地 nick（别把垃圾塞进后续 NICK/USER/身份比较）。
 				const wanted = params[1];
-				this.#nick = `${wanted && wanted !== "*" ? wanted : this.#nick}_`;
+				const usable = wanted !== undefined && wanted !== "*" && isValidServerNick(wanted);
+				if (wanted && wanted !== "*" && !usable) {
+					this.#logger?.warn("IRC 433 里的 nick 不合法，忽略", { nick: wanted });
+				}
+				this.#nick = `${usable ? (wanted as string) : this.#nick}_`;
 				this.#logger?.warn("IRC 昵称被占用，改用", { nick: this.#nick });
 				this.send(`NICK ${this.#nick}`);
+				return;
+			}
+			case "NICK": {
+				// 服务端/自己改名（昵称冲突、NickServ enforce 都会走这里）：prefix 里的 nick 与
+				// 当前身份相等才认（casemapping 折叠），且新 nick 必须合法。
+				const from = prefixNick(prefix);
+				if (!from || !nickEquals(from, this.#nick)) return;
+				const next = params[0] ?? "";
+				if (!isValidServerNick(next)) {
+					this.#logger?.warn("IRC 改名的新 nick 不合法，忽略", { nick: next });
+					return;
+				}
+				this.#nick = next;
 				return;
 			}
 			case "PRIVMSG":
@@ -551,7 +679,7 @@ export class IrcClient {
 				const target = params[0] ?? "";
 				const text = params[1] ?? "";
 				const from = prefixNick(prefix);
-				if (!target || !from || from === this.#nick) return;
+				if (!target || !from || nickEquals(from, this.#nick)) return;
 				// CTCP（\x01ACTION …\x01 等）不属于对话正文，忽略以免噪声进模型上下文。
 				if (text.startsWith("\u0001")) return;
 				const message: IrcInboundMessage = {

@@ -140,3 +140,39 @@ describe("keepalive 缺省", () => {
 		expect(config.keepaliveTimeoutSeconds).toBe(30);
 	});
 });
+
+describe("转录回收上限", () => {
+	test("缺省不覆盖 IrcTranscripts 的默认（undefined = 用 64 MiB / 500 文件），也不写 notes", () => {
+		// 默认值只在 IrcTranscripts 里写一份：config 这里的 undefined 是「没说」而不是「0 或某个默认值」。
+		const { config, notes } = load(freshDir(), { IRC_SERVER: "irc.example.org" });
+		expect(config.transcriptMaxBytes).toBeUndefined();
+		expect(config.transcriptMaxFiles).toBeUndefined();
+		expect(notes.some(note => note.includes("转录上限"))).toBe(false);
+	});
+
+	test("文件值与 env 覆盖都生效，并写一条 notes（含未配置那一侧显示为默认）", () => {
+		const dir = freshDir();
+		writeFileSync(path.join(dir, "irc.json"), JSON.stringify({ transcriptMaxFiles: 7 }), "utf8");
+		const fromFile = loadConfig(dir, { env: { IRC_SERVER: "irc.example.org" }, notes: [] });
+		expect(fromFile.config.transcriptMaxFiles).toBe(7);
+		expect(fromFile.config.transcriptMaxBytes).toBeUndefined();
+		expect(fromFile.notes.some(note => note.includes("默认 64 MiB / 7 文件"))).toBe(true);
+
+		const overridden = load(dir, {
+			IRC_SERVER: "irc.example.org",
+			IRC_TRANSCRIPT_MAX_BYTES: String(16 * 1024 * 1024),
+			IRC_TRANSCRIPT_MAX_FILES: "20",
+		});
+		expect(overridden.config.transcriptMaxBytes).toBe(16 * 1024 * 1024);
+		expect(overridden.config.transcriptMaxFiles).toBe(20);
+		expect(overridden.notes.some(note => note.includes("16 MiB / 20 文件"))).toBe(true);
+	});
+
+	test("非法值（0 / 负数 / 小数 / 非数字）忽略并写 notes，不静默变成某个默认", () => {
+		for (const raw of ["0", "-1", "1.5", "abc"]) {
+			const { config, notes } = load(freshDir(), { IRC_SERVER: "irc.example.org", IRC_TRANSCRIPT_MAX_FILES: raw });
+			expect(config.transcriptMaxFiles).toBeUndefined();
+			expect(notes.some(note => note.includes("IRC_TRANSCRIPT_MAX_FILES 值非法，已忽略"))).toBe(true);
+		}
+	});
+});

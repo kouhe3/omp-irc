@@ -111,7 +111,11 @@ function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): IrcRuntime {
 	// cwd 是昵称实例后缀（`{workspace}`）的来源：本机多实例据此得到不同的昵称。
 	const { config } = loadConfig(pi.pi.getAgentDir(), { notes, cwd: ctx.cwd });
 	const logger: IrcLogger = pi.logger;
-	const transcripts = new IrcTranscripts(config.transcriptDir, logger);
+	// 转录回收上限：未配置时传 undefined，由 IrcTranscripts 用缺省（64 MiB / 500 文件）。
+	// 这不只是磁盘卫生——每个新对端 nick 都会新开一份 jsonl，远端能凭空推高目录规模。
+	const transcripts = new IrcTranscripts(config.transcriptDir, logger, {
+		limits: { maxBytes: config.transcriptMaxBytes, maxFiles: config.transcriptMaxFiles },
+	});
 	// 入站注入口（见 IrcRuntime.inject 的注释）：对象不变，方法每次 session_start 换代。
 	const inject: InboundInjector = { sendMessage: (message, options) => pi.sendMessage(message, options) };
 	// 每个会话一份 jsonl 转录：`/irc log`（人）与 `irc log`（模型）都读它，正文不截断。
@@ -159,6 +163,14 @@ function ensureRuntime(pi: ExtensionAPI, ctx: ExtensionContext): IrcRuntime {
 		transcripts,
 		deliver: createHostSink(inject),
 		selfNick: () => client.status().nick,
+		// 白/黑名单鉴权（README「入站鉴权（白/黑名单）」）：被拒的消息仍落转录，只是不注入。
+		policy: config.inboundPolicy,
+		onDenied: event =>
+			logger.debug?.("IRC 入站被策略拒绝", {
+				scope: event.scope,
+				targetId: event.targetId,
+				senderNick: event.senderNick,
+			}),
 	});
 
 	const sendOutbound = createOutboundSender({
@@ -236,6 +248,8 @@ export default function (pi: ExtensionAPI): void {
 		const current = ensureRuntime(pi, ctx);
 		// 宿主会把扩展工厂重新绑定到新会话（runtime 仍是同一份）：入站注入要落到当前会话。
 		current.inject.sendMessage = (message, options) => pi.sendMessage(message, options);
+		// 状态栏也归当前会话：`ui` 只在首次装配时赋过一次，不换代的话新会话的状态栏收不到更新。
+		current.ui = ctx.ui;
 		for (const note of current.notes) current.logger.info(`IRC: ${note}`);
 		if (!current.config.configured) {
 			current.logger.warn(`IRC: 未配置 server，暂不连接（写 ${current.config.configPath} 或设 IRC_SERVER）`);

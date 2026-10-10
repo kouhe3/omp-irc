@@ -78,6 +78,9 @@ function targetHash(scope: ConversationScope, targetId: string): string {
  * 两个目标就共用一条记录（回复静默发给另一个人、转录混在一起）。
  */
 export function encodeConversationId(scope: ConversationScope, targetId: string): string {
+	// `trim()` 只用来算 base（线上 IRC nick/频道名不含两侧空白）；**无损判定与哈希都用未 trim 的
+	// 原始串**：用 trim 后的串判定会让 `aaa` 与 `aaa `（还有 `aaa ` 与 `aaa  `）拿到同一个 id，
+	// 文档承诺的「id 只指向一个目标」就不成立了。
 	const raw = targetId.trim();
 	if (scope === "channel") {
 		const token = raw ? CHANNEL_TOKEN[raw[0] as string] : undefined;
@@ -87,12 +90,12 @@ export function encodeConversationId(scope: ConversationScope, targetId: string)
 			token === undefined
 				? `${CONVERSATION_ID_PREFIX}-chan-${sanitizeIdPart(raw)}`
 				: `${CONVERSATION_ID_PREFIX}-chan-${token}${sanitizeIdPart(rest)}`;
-		const lossless = token !== undefined && rest.toLowerCase() === sanitizeIdPart(rest);
-		return lossless ? base : `${base}${LOSSY_SEPARATOR}${targetHash(scope, raw)}`;
+		const lossless = targetId === raw && token !== undefined && rest.toLowerCase() === sanitizeIdPart(rest);
+		return lossless ? base : `${base}${LOSSY_SEPARATOR}${targetHash(scope, targetId)}`;
 	}
 	// 私聊 base 永不可能是频道 id：频道 id 里必有 `~`（令牌起头），而 base 里不可能有 `~`。
 	const base = `${CONVERSATION_ID_PREFIX}-${sanitizeIdPart(raw)}`;
-	return raw.toLowerCase() === sanitizeIdPart(raw) ? base : `${base}${LOSSY_SEPARATOR}${targetHash(scope, raw)}`;
+	return targetId.toLowerCase() === sanitizeIdPart(raw) ? base : `${base}${LOSSY_SEPARATOR}${targetHash(scope, targetId)}`;
 }
 
 /** 日志/显示用的短 id（nick 太长时卡片里放不下）。 */
@@ -198,8 +201,8 @@ export class ConversationDirectory {
 	}
 
 	/**
-	 * 模型/用户给的引用 → 会话：支持会话 id、显示名、原始 nick/频道名，
-	 * 全部大小写不敏感。
+	 * 模型/用户给的引用 → 会话：支持会话 id 与原始 nick/频道名，全部大小写不敏感
+	 * （`displayName` 不是引用：它只是记录里的展示用字段，不参与解析）。
 	 *
 	 * **id 必须优先于名字**：id 是唯一回复句柄，而对端可以把 nick 起成别条记录的 id
 	 * （nick `irc-alice` 之于 `alice` 的 id `irc-alice`，nick `irc-chan-~homp` 之于频道
@@ -214,7 +217,6 @@ export class ConversationDirectory {
 		if (byId) return byId;
 		for (const record of this.#conversations.values()) {
 			if (record.targetId.toLowerCase() === needle) return record;
-			if (record.displayName.toLowerCase() === needle) return record;
 		}
 		return undefined;
 	}

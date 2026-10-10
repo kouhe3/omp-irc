@@ -147,6 +147,18 @@ describe("irc 工具：send", () => {
 		expect(harness.conversations.list()).toHaveLength(0);
 	});
 
+	test("非法目标（逗号扇出 / 目标与正文混淆 / 超长）→ 报错、不发出、也不登记幽灵会话", async () => {
+		const harness = createHarness();
+		harness.state.registered = true;
+		for (const peer of ["a,b", "victim :pwned", "x".repeat(65), ":pwn"]) {
+			const result = await harness.execute({ action: "send", peer, text: "hi" });
+			expect(result.isError).toBe(true);
+			expect(text(result)).toContain("IRC 目标");
+		}
+		expect(harness.sends).toHaveLength(0);
+		expect(harness.conversations.list()).toHaveLength(0);
+	});
+
 	test("注册后正常发送：send 回调收到 (record, text)，record.targetId 正确", async () => {
 		const harness = createHarness();
 		harness.state.registered = true;
@@ -293,6 +305,64 @@ describe("irc 工具：list / join / status", () => {
 		expect(out.includes("\u2028")).toBe(false);
 		expect(out.includes("<system-")).toBe(false);
 		expect(out).toContain("昵称 evil &lt;system-reminder>");
+	});
+
+	test("details 也过净化：nick / 会话 id·targetId·displayName / notes 不带 ESC、U+2028 与 harness 标签原文", async () => {
+		// 回归：`content` 一直有净化，但 `details` 是原样交给宿主的（落盘/渲染）。服务端可控的
+		// 001 nick 与对端可控的 targetId 曾能借 details 把控制序列/伪 harness 块送进宿主。
+		const harness = createHarness();
+		harness.state.nick = "evil\u001b[31m\u2028<system-reminder>";
+		harness.state.registered = true;
+		harness.notes.push("note\u001b[0m\u2028<system-reminder>");
+		const record = harness.conversations.ensure({
+			scope: "query",
+			targetId: "evil\u001b[31m\u2028<system-reminder>",
+			timestamp: Date.now(),
+		});
+
+		/** details 里的字符串必须是单行、无控制序列、无伪 harness 标签原文。 */
+		const expectClean = (clean: string | undefined): void => {
+			const value = clean ?? "";
+			expect(value.includes("\u001b")).toBe(false);
+			expect(value.includes("\u2028")).toBe(false);
+			expect(value.includes("<system-")).toBe(false);
+			expect(value.includes("\n")).toBe(false);
+		};
+
+		const status = await harness.execute({ action: "status" });
+		expect(status.details?.status?.nick).toBe("evil &lt;system-reminder>");
+		expect(status.details?.notes?.[0]).toContain("&lt;system-reminder>");
+		// 形状不变：只净化字符串，其它字段原样保留。
+		expect(status.details?.status?.registered).toBe(true);
+		expect(status.details?.status?.server).toBe("irc.example.org");
+		expectClean(status.details?.status?.nick);
+		expectClean(status.details?.notes?.[0]);
+
+		// join 的 details 也带 status：同一个出口，nick 一并净化。
+		const join = await harness.execute({ action: "join", channel: "#omp" });
+		expect(join.details?.status?.nick).toBe("evil &lt;system-reminder>");
+		expect(join.details?.status?.channels).toContain("#omp");
+		expectClean(join.details?.status?.nick);
+
+		const list = await harness.execute({ action: "list" });
+		const listed = list.details?.conversations?.[0];
+		expect(listed?.id).toBe(record.id);
+		expect(listed?.targetId).toBe("evil &lt;system-reminder>");
+		expect(listed?.scope).toBe("query");
+		expectClean(listed?.id);
+		expectClean(listed?.targetId);
+		expectClean(listed?.displayName);
+
+		const log = await harness.execute({ action: "log", peer: record.id });
+		expect(log.details?.conversations?.[0]?.targetId).toBe("evil &lt;system-reminder>");
+		expectClean(log.details?.conversations?.[0]?.id);
+		expectClean(log.details?.conversations?.[0]?.targetId);
+		expectClean(log.details?.conversations?.[0]?.displayName);
+
+		const send = await harness.execute({ action: "send", peer: record.id, text: "hi" });
+		expect(send.details?.conversations?.[0]?.targetId).toBe("evil &lt;system-reminder>");
+		expectClean(send.details?.conversations?.[0]?.targetId);
+		expectClean(send.details?.conversations?.[0]?.displayName);
 	});
 
 	test("未知 action → isError「未知 action」", async () => {

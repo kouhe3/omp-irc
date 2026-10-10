@@ -13,6 +13,7 @@ import {
 	type ConversationDirectory,
 	type ConversationRecord,
 } from "./conversations";
+import { assertIrcTarget } from "./outbound";
 import { formatTranscriptDigest, sanitizeSingleLine, type TranscriptEntry } from "./transcript";
 
 export interface IrcToolDeps {
@@ -33,6 +34,25 @@ export interface IrcToolDetails {
 	conversations?: ConversationRecord[];
 	status?: IrcClientStatus;
 	notes?: string[];
+}
+
+/**
+ * details 里的会话记录：id/targetId/displayName 都是不可信输入（id 由对端可控的 nick/频道名
+ * 派生，targetId 就是它本身），而 details 会原样交给宿主（落盘/渲染），所以出口一并净化。
+ * 只改字符串字段，形状（`ConversationRecord`）不变。
+ */
+function sanitizeRecordDetails(record: ConversationRecord): ConversationRecord {
+	return {
+		...record,
+		id: sanitizeSingleLine(record.id),
+		targetId: sanitizeSingleLine(record.targetId),
+		displayName: sanitizeSingleLine(record.displayName),
+	};
+}
+
+/** details 里的连接状态：`nick` 取自服务端（001 的第一个参数），出口净化；形状不变。 */
+function sanitizeStatusDetails(status: IrcClientStatus): IrcClientStatus {
+	return { ...status, nick: sanitizeSingleLine(status.nick) };
 }
 
 /** `irc` 工具的参数（与 `parameters` 里的 zod schema 同形；测试直接按这个类型喂 `execute`）。 */
@@ -91,7 +111,7 @@ export function defineIrcTool(pi: ExtensionAPI, getDeps: () => IrcToolDeps | und
 												),
 								},
 							],
-							details: { action: params.action, conversations: known } satisfies IrcToolDetails,
+							details: { action: params.action, conversations: known.map(sanitizeRecordDetails) } satisfies IrcToolDetails,
 						};
 					}
 					case "log": {
@@ -108,7 +128,7 @@ export function defineIrcTool(pi: ExtensionAPI, getDeps: () => IrcToolDeps | und
 							content: [
 								{ type: "text" as const, text: formatTranscriptDigest(deps.transcripts.tail(record.id, limit), file) },
 							],
-							details: { action: params.action, conversations: [record] } satisfies IrcToolDetails,
+							details: { action: params.action, conversations: [sanitizeRecordDetails(record)] } satisfies IrcToolDetails,
 						};
 					}
 					case "status": {
@@ -126,12 +146,20 @@ export function defineIrcTool(pi: ExtensionAPI, getDeps: () => IrcToolDeps | und
 						];
 						return {
 							content: [{ type: "text" as const, text: lines.join("\n") }],
-							details: { action: params.action, status, notes: deps.notes } satisfies IrcToolDetails,
+							// details 也是出口：nick 与 notes 一并净化（notes 里会带配置错误里的原始片段）。
+							details: {
+								action: params.action,
+								status: sanitizeStatusDetails(status),
+								notes: deps.notes.map(sanitizeSingleLine),
+							} satisfies IrcToolDetails,
 						};
 					}
 					case "send": {
 						if (!params.peer?.trim()) throw new Error("send 需要 peer");
 						if (!params.text?.trim()) throw new Error("send 需要 text");
+						// 目标先校验再登记：非法引用（含空格/逗号/超长/前导冒号）当场报错，不先建一条
+						// 幽灵会话。校验口径与 resolveOrCreateConversation 的 trim 一致。
+						assertIrcTarget(params.peer.trim());
 						// 先查连接：未注册就直接失败，别先说「已登记」再报错（那会留下幽灵会话）。
 						if (!deps.client.status().registered) throw new Error("IRC 未连接/未注册，消息未发出（status 看原因）");
 						// 主动开口：还没会话过的 nick/频道当场登记（log 则要求已登记，避免给错名建出假会话）。
@@ -139,7 +167,7 @@ export function defineIrcTool(pi: ExtensionAPI, getDeps: () => IrcToolDeps | und
 						await deps.send(record, params.text);
 						return {
 							content: [{ type: "text" as const, text: `已发送到 ${record.id}` }],
-							details: { action: params.action, conversations: [record] } satisfies IrcToolDetails,
+							details: { action: params.action, conversations: [sanitizeRecordDetails(record)] } satisfies IrcToolDetails,
 						};
 					}
 					case "join": {
@@ -154,7 +182,7 @@ export function defineIrcTool(pi: ExtensionAPI, getDeps: () => IrcToolDeps | und
 									text: `已记为留驻频道 ${status.channels.join("、")}${status.registered ? "（已 JOIN）" : "（连接注册后自动 JOIN）"}`,
 								},
 							],
-							details: { action: params.action, status } satisfies IrcToolDetails,
+							details: { action: params.action, status: sanitizeStatusDetails(status) } satisfies IrcToolDetails,
 						};
 					}
 					default:

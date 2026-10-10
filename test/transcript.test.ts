@@ -1,8 +1,8 @@
 /**
  * 转录文件测试：宿主会话文件格式（`omp render` 之类宿主工具能直接读）、
- * 原文不截断、滚动窗口、尾部读取、显示前净化。
+ * 原文不截断（仅单条超 1 MiB 时截断）、滚动窗口、尾部读取、目录级回收、显示前净化。
  */
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -11,6 +11,8 @@ import {
 	escapeHarnessTags,
 	formatTranscriptDigest,
 	IrcTranscripts,
+	sanitizeForDisplay,
+	sanitizeForLedger,
 	sanitizeSingleLine,
 	stripControl,
 } from "../src/transcript";
@@ -154,6 +156,103 @@ describe("IrcTranscripts", () => {
 		expect(JSON.parse((await Bun.file(file).text()).trim().split("\n")[0] ?? "").type).toBe("session");
 		expect(store.tail(CONVERSATION, 1)[0]?.text).toBe("轮转后的新消息");
 	});
+
+	test("轮转只写 readSync 真正读到的字节：短读不会把未初始化内存（NUL）写进账本", async () => {
+		const store = transcripts();
+		const file = store.pathFor(CONVERSATION);
+		mkdirSync(path.dirname(file), { recursive: true });
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: `irc-${CONVERSATION}`,
+			timestamp: new Date().toISOString(),
+			cwd: ".",
+		});
+		writeFileSync(file, `${header}\n${"z".repeat(64 * 1024)}\n`);
+		// 真实文件只有 ~64 KiB，但让 `#size()` 报告 8 MiB：轮转就会从**远超 EOF 的偏移**读，
+		// `readSync` 因此短读（返回 0）。单进程里没法靠并发删/截断文件来复现短读，
+		// 所以只替换 Bun.file 报告的 size（`#size()` 是 private，没别的注入点）。
+		const realFile = Bun.file;
+		const reported = 8 * 1024 * 1024;
+		Bun.file = ((p: unknown, ...rest: unknown[]) =>
+			String(p) === file
+				? { size: reported }
+				: (realFile as unknown as (...args: unknown[]) => unknown)(p, ...rest)) as unknown as typeof Bun.file;
+		try {
+			store.record(CONVERSATION, { role: "user", text: "短读之后的新消息" });
+		} finally {
+			Bun.file = realFile;
+		}
+		const written = await Bun.file(file).text();
+		// 忽略 bytesRead 的写法会把 512 KiB `allocUnsafe` 的未初始化内存写进去：
+		// 新页通常是 0x00（→ NUL），文件体积也会暴涨到远超真实内容。
+		expect(written.includes("\u0000")).toBe(false);
+		expect(statSync(file).size).toBeLessThan(200 * 1024);
+		expect(written).toContain("短读之后的新消息");
+		// 重写后仍是合法 jsonl，tail() 读得回完整条目。
+		expect(store.tail(CONVERSATION, 1)[0]?.text).toBe("短读之后的新消息");
+	});
+
+	test("单条正文超 1 MiB 按 UTF-8 边界截断并标注（不切碎多字节字符）", async () => {
+		const store = transcripts();
+		// 4 字节 emoji（代理对）+ 3 字节汉字：切点必须落在字符边界上。
+		const long = "\u{1f600}字".repeat(400_000);
+		expect(Buffer.byteLength(long, "utf8")).toBeGreaterThan(1024 * 1024);
+		store.record(CONVERSATION, { role: "user", text: long });
+
+		const lines = (await Bun.file(store.pathFor(CONVERSATION)).text()).trim().split("\n");
+		expect(lines).toHaveLength(2); // header + 一条（截断后仍是完整的一行 JSON）
+		const text: string = JSON.parse(lines[1] ?? "").message.content[0].text;
+		const mark = "…[已截断]";
+		expect(text.endsWith(mark)).toBe(true);
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(1024 * 1024);
+		// 前缀仍是原文（按字符边界切，不是按字节乱切），且没有半个多字节字符被解码成 U+FFFD。
+		expect(long.startsWith(text.slice(0, text.length - mark.length))).toBe(true);
+		expect(text.includes("\ufffd")).toBe(false);
+	});
+
+	test("转录回收：超 maxFiles 按 mtime 最旧先删，最新几个留下", async () => {
+		const dir = mkdtempSync(path.join(os.tmpdir(), "irc-reclaim-"));
+		let clock = 1_000_000;
+		const store = new IrcTranscripts(dir, undefined, { limits: { maxFiles: 3 }, now: () => clock });
+		for (const id of ["irc-a", "irc-b", "irc-c", "irc-d", "irc-e"]) {
+			store.record(id, { role: "user", text: `来自 ${id}` });
+			clock += 31_000; // 推进一格，让下一次 record 的节流检查放行
+		}
+		expect(readdirSync(dir).sort()).toEqual(["irc-c.jsonl", "irc-d.jsonl", "irc-e.jsonl"]);
+
+		// 被删会话的 #lastEntry 也清了：再写它时 parentId 回落到 header id，
+		// 而不是指向一个已经不在盘上的旧条目 id。
+		store.record("irc-a", { role: "user", text: "重建" });
+		const lines = (await Bun.file(store.pathFor("irc-a")).text()).trim().split("\n");
+		expect(JSON.parse(lines.at(-1) ?? "").parentId).toBe("irc-irc-a");
+	});
+
+	test("转录回收：总量超 maxBytes 也绝不删正在写的那个文件", () => {
+		const dir = mkdtempSync(path.join(os.tmpdir(), "irc-reclaim-"));
+		let clock = 0;
+		const store = new IrcTranscripts(dir, undefined, {
+			limits: { maxBytes: 1 }, // 任何文件都算超限
+			now: () => (clock += 31_000),
+		});
+		store.record("irc-a", { role: "user", text: "甲" });
+		store.record("irc-b", { role: "user", text: "乙" });
+		store.record("irc-c", { role: "user", text: "丙" });
+		expect(readdirSync(dir)).toEqual(["irc-c.jsonl"]);
+		expect(store.tail("irc-c", 1)[0]?.text).toBe("丙");
+	});
+
+	test("转录回收按 30 s 节流：时钟不走就不重复扫目录删文件", () => {
+		const dir = mkdtempSync(path.join(os.tmpdir(), "irc-reclaim-"));
+		let clock = 1_000_000;
+		const store = new IrcTranscripts(dir, undefined, { limits: { maxFiles: 1 }, now: () => clock });
+		store.record("irc-a", { role: "user", text: "甲" });
+		clock += 31_000;
+		store.record("irc-b", { role: "user", text: "乙" }); // 间隔够 → 检查 → 删掉更旧的 irc-a
+		expect(readdirSync(dir)).toEqual(["irc-b.jsonl"]);
+		store.record("irc-c", { role: "user", text: "丙" }); // 时钟没动 → 这次不检查 → irc-b 还在
+		expect(readdirSync(dir).sort()).toEqual(["irc-b.jsonl", "irc-c.jsonl"]);
+	});
 });
 
 describe("stripControl（显示前净化：消息原文是不可信输入）", () => {
@@ -213,6 +312,34 @@ describe("stripControl（显示前净化：消息原文是不可信输入）", (
 
 	test("没有记录时给出文件路径而不是空串", () => {
 		expect(formatTranscriptDigest([], "/tmp/x.jsonl")).toBe("还没有消息记录（文件：/tmp/x.jsonl）");
+	});
+});
+
+describe("stripControl 的不可见格式字符（Cf）剥离", () => {
+	test("双向控制与零宽格式字符三层净化都不再存活", () => {
+		// U+202A-E LRE/RLE/PDF/LRO/RLO、U+2066-9 LRI/RLI/FSI/PDI、U+200E/200F LRM/RLM（Trojan Source
+		// 那类视觉重排）、U+200B ZWSP、U+FEFF BOM/零宽不换行空格、U+00AD 软连字符（可伪装 URL）。
+		const hostile = "a\u202ab\u202ec\u2066d\u2069e\u200ef\u200bg\ufeffh\u00adi";
+		const clean = "abcdefghi";
+		expect(stripControl(hostile)).toBe(clean);
+		expect(sanitizeForLedger(hostile)).toBe(clean);
+		expect(sanitizeForDisplay(hostile)).toBe(clean);
+		expect(sanitizeSingleLine(hostile)).toBe(clean);
+		// 行首 BOM 也一样（正文里的 U+FEFF 不是编码标记，只是不可见字符）。
+		expect(stripControl("\ufeff你好")).toBe("你好");
+	});
+
+	test("保留 ZWNJ/ZWJ（emoji ZWJ 序列与印度语系连字要用，且不是双向控制字符）", () => {
+		// 反向断言：U+200C/U+200D 也在 Cf 里，但它们是**字形连接符**，剥掉会把可见字形拆坏，
+		// 而它们不改变字符顺序（不是双向控制），对端拿不到任何视觉重排/隐藏能力。
+		// 谁要是把 INVISIBLE_FORMAT 改成整个 \p{Cf}，这两条就会红。
+		const emoji = "👨\u200d👩\u200d👧"; // 家庭 emoji（ZWJ 连接成一个字形）
+		const indic = "\u0915\u094d\u200c\u0937"; // क्ष（ZWNJ 参与连字）
+		for (const keep of [emoji, indic, "a\u200cb", "a\u200db"]) {
+			expect(stripControl(keep)).toBe(keep);
+			expect(sanitizeForLedger(keep)).toBe(keep);
+			expect(sanitizeSingleLine(keep)).toBe(keep);
+		}
 	});
 });
 

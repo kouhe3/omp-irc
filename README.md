@@ -46,6 +46,8 @@ bun run e2e:host            # 宿主级端到端（真 omp 进程 + mock ircd）
 	"nick": "omp",
 	"nickSuffix": "{workspace}",
 	"channels": ["#agents", "#dev"],
+	"allowUsers": ["alice", "bob"],
+	"blockChannels": ["#noisy"],
 	"password": "server-password",
 	"transcriptDir": "/path/to/transcripts"
 }
@@ -59,8 +61,14 @@ bun run e2e:host            # 宿主级端到端（真 omp 进程 + mock ircd）
 | `nick` | `"omp"` | **基础**昵称；最终昵称 = `nick` + `-` + 展开后的 `nickSuffix`（见下） |
 | `nickSuffix` | `"{workspace}"` | **实例后缀**模板：`{workspace}` → 工作区目录名（`ctx.cwd` 的 basename），`{hash}` → 工作区路径的 4 位短哈希；置 `""`/`false`/`"off"` 关闭 |
 | `channels` | `[]` | 启动即 JOIN 的频道；空则只收私聊 |
+| `allowUsers` | `[]` | 私聊**白名单**（nick）：非空 = 只收这些人的私聊。见「入站鉴权（白/黑名单）」 |
+| `blockUsers` | `[]` | 私聊**黑名单**（nick）：命中即拒，**优先于白名单** |
+| `allowChannels` | `[]` | 频道**白名单**：非空 = 只收这些频道的消息 |
+| `blockChannels` | `[]` | 频道**黑名单**：命中即拒，**优先于白名单** |
 | `password` | 无 | **连接密码**（IRC `PASS`），不是 SASL |
 | `transcriptDir` | `<agentDir>/irc-transcripts` | 每个会话一份 jsonl 转录的目录（文件名 = 会话 id） |
+| `transcriptMaxBytes` | 64 MiB | 转录目录**总字节**上限：超出按 mtime **删最旧**的转录文件（远端换个 nick 就多一份文件，所以必须有回收；每 30s 至多扫一次目录） |
+| `transcriptMaxFiles` | 500 | 转录目录**文件数**上限：同一套回收机制 |
 | `keepaliveSeconds` | `60`（`0` 关闭心跳） | 心跳：每这么久主动发一次 `PING :token`。**半开连接只能靠它发现**——对端把我们踢掉、FIN 却没到达本机时不会产生任何 socket 事件（`netstat` 一直 ESTABLISHED，`close` 永不触发），只靠 `close` 驱动的重连永远不会触发。60s 也小于常见 ircd 的 idle ping 阈值，顺带让服务端的 `Ping timeout` 等不到超时 |
 | `keepaliveTimeoutSeconds` | `30` | 发出 `PING` 后这么久内**没有任何入站行**（PONG、服务端 PING、别人的消息都算）就判死：断开并走既有退避重连。这只是**等一个 PONG 的预算**，与间隔无关——间隔拉长不会让断线更晚被发现 |
 
@@ -68,6 +76,8 @@ bun run e2e:host            # 宿主级端到端（真 omp 进程 + mock ircd）
 
 `IRC_SERVER`、`IRC_PORT`、`IRC_TLS`、`IRC_NICK`、`IRC_NICK_SUFFIX`、`IRC_CHANNELS`（逗号分隔）、
 `IRC_PASSWORD`、`IRC_TRANSCRIPT_DIR`、`IRC_KEEPALIVE_SECONDS`、`IRC_KEEPALIVE_TIMEOUT_SECONDS`、
+`IRC_ALLOW_USERS`、`IRC_BLOCK_USERS`、`IRC_ALLOW_CHANNELS`、`IRC_BLOCK_CHANNELS`（逗号分隔）、
+`IRC_TRANSCRIPT_MAX_BYTES`、`IRC_TRANSCRIPT_MAX_FILES`、
 `IRC_CONFIG_PATH`（改配置文件位置，测试/多实例隔离用）。
 
 ### 多实例：实例专属昵称
@@ -90,17 +100,43 @@ QQ 渠道是单例，IRC 不是：**同一台机器上的每个 omp 进程都是
 `/irc status` 与 `irc status` 都显示最终昵称，状态栏连上后也显示它（`IRC ● omp-jxai（2 会话）`），
 多个实例并排开着时一眼看出哪个窗口是哪个实例。
 
+### 入站鉴权（白/黑名单）
+
+默认**全放行**（不配任何白/黑名单 = 现状行为）。要收紧时按两个维度控制：**私聊**按发送者
+nick 判，**频道**按频道名判。四个键（`irc.json` 字段名 = env 名去掉 `IRC_` 后缀）：
+
+| 键 | env | 维度 | 作用 |
+| --- | --- | --- | --- |
+| `allowUsers` | `IRC_ALLOW_USERS` | 私聊 | 白名单（nick）；非空 = 只收这些人的私聊 |
+| `blockUsers` | `IRC_BLOCK_USERS` | 私聊 | 黑名单（nick）；命中即拒 |
+| `allowChannels` | `IRC_ALLOW_CHANNELS` | 频道 | 白名单（频道名）；非空 = 只收这些频道的消息 |
+| `blockChannels` | `IRC_BLOCK_CHANNELS` | 频道 | 黑名单（频道名）；命中即拒 |
+
+取值可以是 `irc.json` 里的字符串数组，也可以是 env 里的英文逗号分隔字符串
+（`IRC_ALLOW_USERS=alice,bob`）；两侧都会 trim、丢掉空项，env 同名键覆盖文件。匹配规则：
+
+- **黑名单优先**：先看黑名单，命中即拒（即使它也在白名单里）；
+- **该维度白名单非空即进入白名单模式**：未命中就拒；白名单为空则放行（只受黑名单约束）；
+- **大小写不敏感**：nick 按 RFC1459 casemapping 折叠（大小写 + `[]{}\|~^`），频道名比较前先小写；
+- 频道名要显式写 `#`/`&` 前缀；没写前缀按 `#<名字>` 补（口径同 `/irc join`）。
+
+被拒的消息**仍会落转录**（转录是全量账本，`irc log` 读得到），只是不注入主会话、不唤起
+agent，并记一条 debug 日志（`IRC 入站被策略拒绝`）。改配置后重启（或 `/irc connect` 重载）生效。
+
+**这不是密码学身份**：IRC 的 nick 可以被伪造（尤其敌对 ircd 能随便用别人的 nick 发消息），
+白名单只是「按名字过滤」，挡不住能控制链路/服务端的人。见下节。
+
 ## 用法
 
 **IRC 会话不是 omp 子会话**：`write agent://…` 到不了它。出站只有两条路——模型侧的 `irc`
 工具，人侧的 `/irc` 命令；会话 id 只在这两处的参数/引用、以及转录文件名里使用。
 工具侧参数是命名的（`action` 取 `list|send|join|status|log`），例如
 `{"action":"send","peer":"irc-alice","text":"…"}`；命令侧是位置参数。`peer` 与命令里的
-`<peer>` 都支持会话 id / nick / 频道 / 显示名（大小写不敏感）。
+`<peer>` 都支持会话 id / nick / 频道（大小写不敏感）。
 
 | 用法 | 作用 |
 | --- | --- |
-| `irc send` / `/irc send <peer> <正文>` | 发一条 PRIVMSG；引用支持会话 id / nick / 频道 / 显示名。**还没聊过的 nick 会当场登记**，不必等对方先开口 |
+| `irc send` / `/irc send <peer> <正文>` | 发一条 PRIVMSG；引用支持会话 id / nick / 频道。**还没聊过的 nick 会当场登记**，不必等对方先开口 |
 | `irc list` / `/irc list` | 已知会话（id / 类型 / 最近活跃 / 原始目标） |
 | `irc log` / `/irc log <peer> [条数]` | 某个会话的收发账本（正文；出站长文会在 512 字节处切成多条 PRIVMSG，这里能看到完整正文与顺序）；省略 `<peer>` 且只有一个会话时自动选它 |
 | `irc join` / `/irc join <#频道>` | JOIN 并记为**留驻频道**（断线重连后自动重新 JOIN）；缺 `#` 自动补 |
@@ -216,8 +252,13 @@ id 是 `(类型, 原始目标)` 的**纯函数**：不随收发/淘汰顺序变�
   或那行回复指引，也能在 `irc log` 的 digest 里伪造一行 `[omp] …`（模型会把 digest 当账本读）。
   出口共用 `sanitizeSingleLine`（`src/transcript.ts`）：入站卡片、`irc log`/`/irc log` 的 digest、
   `irc list`/`/irc list` 的会话行、`status` 里的昵称。
-- **正文长度**：入站一张卡片 = 一条 IRC 消息（RFC1459 单行 ≤512 字节，扩展不额外截断）；
-  出站长文由客户端按 512 字节切成多条 PRIVMSG，对端看到的是分段。转录与 `irc log` 保留正文与顺序。
+- **入站长度上限**：单条 IRC 行超过 `MAX_INBOUND_LINE_BYTES`（8 KiB）直接丢弃（不进模型上下文）；
+  分帧缓冲里长时间没有完整行、累计超过 `MAX_INBOUND_BUFFER_BYTES`（64 KiB）就判错并断开（走既有退避重连）
+  ——对端只要一直发不带 `\n` 的字节，没有这道闸口就能把宿主内存撑爆。出站长文由客户端按 512 字节切成
+  多条 PRIVMSG，对端看到的是分段。转录与 `irc log` 保留正文与顺序（单条正文超 1 MiB 会截断并标注）。
+- **注册超时**：TCP 连上后 `REGISTER_TIMEOUT_MS`（15s）内没等到 `001` 就断开重连——对端「接受连接
+  但不完成握手」不会再让渠道永久静默；指数退避只在**注册成功后**归零，所以 accept-then-close 循环
+  不会退化成固定 500ms 重试。
 - **回复指引**：卡片正文末尾固定跟一行 `回复：irc 工具 {...}`——放在正文之后，正文再长也不会被埋在开头。
 - **清理**：`session_shutdown` 时停客户端、清空会话目录、清掉状态栏那一格；子会话
   （`kind: "sub"`）不连接也不清理——IRC 连接是进程级单例，只归主会话。
@@ -287,19 +328,48 @@ logging:
 
 **共用的话务必做成服务**（别在 SSH 前台跑）：`/etc/systemd/system/ergo.service` 里 `ExecStart=/opt/ergo/ergo run --conf /opt/ergo/ircd.yaml`、`WorkingDirectory=/opt/ergo`、`Restart=always`，然后 `systemctl enable --now ergo`；日志用 `journalctl -u ergo -f`，升级只需替换 `/opt/ergo/ergo` 后 `systemctl restart ergo`。
 
+## 接入公共 IRC 服务器的风险
+
+这是一个把**不可信外部输入直接喂给能调用 shell 的 agent** 的渠道。接公共 ircd 前先认清下面几条：
+
+- **明文链路**：`tls` 默认关（明文 6667）。配了 `password` 也只是明文 `PASS`——线上任何人抓包
+  就能拿到，且整条会话内容可被中继方读取/篡改。公共网络务必 `"tls": true`。
+- **没有端到端认证**：IRC 的消息不签名、不加密到对端；服务端（以及链路上的任何中间人）能改、能插、
+  能重放。
+- **nick 可以伪造**：尤其敌对 ircd 能拿别人的 nick 发消息，也能给我们塞 `NICK`/`PRIVMSG` 里的任意
+  身份串。**白名单是按名字过滤，不是密码学身份**——它能挡走路过的陌生人，挡不住控制链路或服务端的人。
+- **默认放行 = 谁都能唤起 agent**：不配白/黑名单时，任何能给本实例发私聊、或在共享频道里发言的人，
+  都能让我们的主会话起一轮，而 agent 手握 shell。**接公共服务器就该配白名单/专用频道。**
+- **prompt injection**：对端正文是不可信输入。虽然入站正文已剥离控制序列、转义 harness 标签、
+  压平换行（见 `src/inbound.ts`），但仍足以诱导 agent 去读/发本地文件（`irc send` 能外发任意内容）、
+  执行命令。不要让它替你去碰不信任的频道。
+- **没有速率限制**：本扩展不做限流（设计如此），对端可以刷屏——既刷屏你的 TUI，也刷 token/账单。
+  只能在服务端（ircd 防洪、`+m`/`+i` 等频道模式）或网络层挡。
+- **第三方可见**：服务器管理员、以及频道里的其它成员都能看到收发内容（频道不是私密信道）。
+- **终端视觉欺骗仍有残余风险**：显示前会剥 ESC/OSC 等控制序列与大部分 Cf 字符（防 ANSI 注入），
+  但 Unicode 双向文本/同形字这类纯文本层面的伪装不可能完全消除——别把 TUI 里看到的名字当成身份。
+
+**推荐做法**：自建或私有 ircd（见上节）；开 `tls`；配白名单（或专用频道 + 频道模式 `+i`/`+k`）；
+给机器人开专用频道并只在受控网络里放行；不要把能唤起 agent 的实例暴露在公共 ircd 上。
+
 ## 测试
 
 - `test/mock-irc-server.ts`：`net.createServer` 的 mock IRC server（真 TCP、真线格式，按 IRC 语义转发频道/私聊消息）。
-- `test/protocol.test.ts`：CRLF 分帧、`parseIrcLine`、512 字节切分、注册/`PING`→`PONG`/`JOIN`/433/退避重连与重新 JOIN、心跳（半开连接判死）。
-- `test/conversations.test.ts`：会话 id 编解码（纯函数：安全名拿基 id，有损名带 16 位哈希、与 scope 绑定）+ 会话目录（登记/解析/淘汰/淘汰后重建仍同 id）+ 入站注入管线（假 `InboundInjector` 断言 `irc:message` 卡片、`deliverAs: "steer"`、回复指引、净化、harness 标签转义）。
-- `test/transcript.test.ts`：转录格式、入账净化（剥控制序列 / 伪换行压空格）、正文不截断、滚动窗口、尾部读取、显示前净化。
-- `test/tool.test.ts`：`irc` 工具的五个 action（send 的未注册拒绝与不留幽灵会话、log 的解析与条数上限、list、join、status）。
+- `test/protocol.test.ts`：CRLF 分帧、`parseIrcLine`、512 字节切分、注册/`PING`→`PONG`/`JOIN`/433/退避重连（**注册成功才归零**）与重新 JOIN、心跳（半开连接判死）。
+- `test/client-limits.test.ts`：传输层加固：`nickEquals` 的 RFC1459 折叠、入站单行/缓冲上限与 warn-once、001/433 与 `NICK` 的服务端可控 nick 校验、accept-then-close 退避序列、注册超时（武装/001 清/close 清/未 connect 不武装）。
+- `test/conversations.test.ts`：会话 id 编解码（纯函数：安全名拿基 id，有损名带 16 位哈希、与 scope 绑定、**前后空白变体不再同 id**）+ 会话目录（登记/解析**只认 id 与原始目标名**/淘汰/淘汰后重建仍同 id）+ 入站注入管线（假 `InboundInjector` 断言 `irc:message` 卡片、`deliverAs: "steer"`、回复指引、净化、harness 标签转义）。
+- `test/transcript.test.ts`：转录格式、入账净化（剥控制序列+Cf 格式字符但**保留 ZWJ/ZWNJ** / 伪换行压空格）、单条超限截断、滚动窗口不留未初始化字节、目录级回收（超 maxBytes/maxFiles 删最旧、不删当前文件、30s 节流）、尾部读取、显示前净化。
+- `test/tool.test.ts`：`irc` 工具的五个 action（send 的未注册拒绝与不留幽灵会话、log 的解析与条数上限、list、join、status），以及 `details` 出口与 `content` 同口径净化。
+- `test/target-validation.test.ts`：出站目标校验（`assertIrcTarget`：`a,b` 扇出 / `victim :pwned` 混淆 / 超 64 字节 / 前导 `:` 全部拒绝，且在 `privmsg` 之前就抛，转录与 touch 不动作）。
 - `test/extension.test.ts`：`index.ts` 的装配与生命周期（真 socket + stub `ExtensionAPI`）：主会话连接/注册/JOIN、子会话不连接也不改编注入目标、退出清理。
 - `test/commands.test.ts`：`/irc connect|disconnect` 的决策与文案（未配置时不碰客户端、已在连接不重复 start、
   断开后 `status` 给出重连入口）、`status` 的连接状态机（未连接 / 连接中 / 重连中 / 已注册）、
   `send` 的引用解析与未注册时的拒绝。
 - `test/config.test.ts`：实例专属昵称的推导（工作区标签收敛与哈希退化、`nickSuffix` 模板/关闭/长度上限、
   env 覆盖、notes 文案）。
+- `test/inbound-policy.test.ts`：入站白/黑名单（`isInboundAllowed` 纯函数 + 真实入站管线）：黑名单优先、
+  白名单模式下拒收但仍落转录、未配白名单的维度放行、频道名大小写/前缀归一、nick RFC1459 折叠、
+  配置解析（文件数组 / env 逗号分隔 / 非法值忽略 + notes 摘要）。
 - `test/e2e-mock.ts`（`bun run e2e`）：真 TCP + mock server + 假注入面：入站注入断言、工具/命令出站 PRIVMSG 上线、512 切分、断线重连后重新 JOIN、`/irc disconnect` 期间 `/irc send` 拒绝；另含 `index.ts` 的装配冒烟（stub `ExtensionAPI`，不需要 `AgentRegistry`）。
 - `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock ircd（`IRC_E2E_SERVER=host:port` 可改连外部 ircd），证明扩展在真宿主里 JOIN 后，入站频道/私聊消息以 `irc:message` 卡片落进真宿主会话 jsonl（扩展自己的转录里同样有正文），`/irc send` 出站上线。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。
 

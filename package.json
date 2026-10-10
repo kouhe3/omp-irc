@@ -10,6 +10,7 @@
 		]
 	},
 	"scripts": {
+		"audit": "bun audit --registry https://registry.npmjs.org",
 		"check": "bun x tsc --noEmit",
 		"test": "bun test",
 		"e2e": "bun run test/e2e-mock.ts",
