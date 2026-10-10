@@ -1,5 +1,7 @@
 # IRC 渠道扩展（omp-irc-channel）
 
+[![CI](https://github.com/kouhe3/omp-irc/actions/workflows/ci.yml/badge.svg)](https://github.com/kouhe3/omp-irc/actions/workflows/ci.yml)
+
 把 omp 作为 **IRC 客户端**接入任意 IRC server（RFC1459 子集），让 omp 与 IRC 上的其它
 agent 对等通话：
 
@@ -373,4 +375,16 @@ logging:
 - `test/e2e-mock.ts`（`bun run e2e`）：真 TCP + mock server + 假注入面：入站注入断言、工具/命令出站 PRIVMSG 上线、512 切分、断线重连后重新 JOIN、`/irc disconnect` 期间 `/irc send` 拒绝；另含 `index.ts` 的装配冒烟（stub `ExtensionAPI`，不需要 `AgentRegistry`）。
 - `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock ircd（`IRC_E2E_SERVER=host:port` 可改连外部 ircd），证明扩展在真宿主里 JOIN 后，入站频道/私聊消息以 `irc:message` 卡片落进真宿主会话 jsonl（扩展自己的转录里同样有正文），`/irc send` 出站上线。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。
 
+- `test/ci-agent-dir.ts`（CI 用，也可本地跑）：把本 checkout 挂进一个**干净**的 `PI_CODING_AGENT_DIR`
+  的 `extensions/irc`（symlink / Windows junction）。`e2e:host` 起真宿主，而宿主只从
+  `<agentDir>/extensions/<name>/` 发现扩展：CI 上 checkout 在别处，不挂就「宿主起来但扩展没加载」，
+  e2e 会以 bot 未 JOIN 的形式全挂；干净 agentDir 同时保证 CI 机器上的用户配置/凭据不参与。
+
 测试不睡真实时间：等待全部走事件驱动的 `Gate` / `server.waitForLine` / `server.waitUntil`。
+
+### CI（GitHub Actions）
+
+`.github/workflows/ci.yml` 在 `ubuntu-latest` 与 `windows-latest` 上跑同一套门槛（与本地逐条对齐）：
+`bun install --frozen-lockfile` → `bun x tsc --noEmit` → `bun test` → `bun run test/e2e-mock.ts` →
+`bun run test/e2e-host.ts`（后两步带 `PI_CODING_AGENT_DIR=$RUNNER_TEMP/omp-agent`，即上面那个干净 agentDir）。
+bun 钉 1.4.2（与本地一致），push `main` 与任意 PR 触发，同分支新推送取消旧跑动。

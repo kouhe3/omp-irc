@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消旧的跑动，省 runner。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # 一个平台挂掉不藏另一个平台的结果。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与本地开发同一版本：bun.lock 是 lockfileVersion 2 的文本锁。
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      - name: bun install
+        run: bun install --frozen-lockfile
+
+      - name: 类型检查
+        run: bun x tsc --noEmit
+
+      - name: 单元测试
+        run: bun test
+
+      - name: e2e（真 TCP + mock server）
+        run: bun run test/e2e-mock.ts
+
+      # e2e:host 起真 omp 宿主，宿主只认 <agentDir>/extensions/<name>/：
+      # 把它指到一个干净目录，再把本 checkout 挂进去（免得上一个步骤的宿主起不来）。
+      - name: 准备干净的 agentDir
+        env:
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/omp-agent
+        run: bun run test/ci-agent-dir.ts
+
+      - name: e2e-host（真 omp 进程 + mock ircd）
+        env:
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/omp-agent
+        run: bun run test/e2e-host.ts
