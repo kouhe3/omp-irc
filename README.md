@@ -375,10 +375,16 @@ logging:
 - `test/e2e-mock.ts`（`bun run e2e`）：真 TCP + mock server + 假注入面：入站注入断言、工具/命令出站 PRIVMSG 上线、512 切分、断线重连后重新 JOIN、`/irc disconnect` 期间 `/irc send` 拒绝；另含 `index.ts` 的装配冒烟（stub `ExtensionAPI`，不需要 `AgentRegistry`）。
 - `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock ircd（`IRC_E2E_SERVER=host:port` 可改连外部 ircd），证明扩展在真宿主里 JOIN 后，入站频道/私聊消息以 `irc:message` 卡片落进真宿主会话 jsonl（扩展自己的转录里同样有正文），`/irc send` 出站上线。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。
 
-- `test/ci-agent-dir.ts`（CI 用，也可本地跑）：把本 checkout 挂进一个**干净**的 `PI_CODING_AGENT_DIR`
-  的 `extensions/irc`（symlink / Windows junction）。`e2e:host` 起真宿主，而宿主只从
-  `<agentDir>/extensions/<name>/` 发现扩展：CI 上 checkout 在别处，不挂就「宿主起来但扩展没加载」，
-  e2e 会以 bot 未 JOIN 的形式全挂；干净 agentDir 同时保证 CI 机器上的用户配置/凭据不参与。
+- `test/ci-agent-dir.ts`（CI 用，也可本地跑）：准备一个**干净**的 `PI_CODING_AGENT_DIR`：
+  ① 把本 checkout 挂成 `<agentDir>/extensions/irc`（symlink / Windows junction）——`e2e:host` 起真宿主，
+  宿主只从 `<agentDir>/extensions/<name>/` 发现扩展，CI 上 checkout 在别处，不挂就「宿主起来但扩展没加载」；
+  ② 装 `test/ci-models.yml` 为 `<agentDir>/models.yml`——宿主非交互模式下解析不出会话模型就直接退出
+  （`No models available.` / `Set an API key environment variable…`），CI 上没有真凭据，用免鉴权的假 provider 顶。
+  干净 agentDir 同时保证 CI 机器上的用户配置/凭据不参与。
+- `test/ci-models.yml`：上面那个假 provider（`auth: none`），baseUrl 指向本机假模型端点；
+  `test/e2e-host.ts` 会在「agentDir 里装的正是本文件」时按 baseUrl 起这个端点，只回 401
+  （鉴权错误对轮次是终止性的，宿主立刻收尾——换成连不上的端点会被反复重试，把「首轮结束」的
+  90s 等待吃满）。本地真 agentDir + 真凭据时完全不碰端口，走宿主自己解析的模型。
 
 测试不睡真实时间：等待全部走事件驱动的 `Gate` / `server.waitForLine` / `server.waitUntil`。
 

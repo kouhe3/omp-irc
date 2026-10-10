@@ -50,6 +50,58 @@ const startedAt = Date.now();
 const agentDir = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".omp", "agent");
 const sessionsRoot = path.join(agentDir, "sessions");
 
+/**
+ * 模型端点：宿主在非交互模式下没有可解析的会话模型就**直接退出**（`src/main.ts`），CI 上没有
+ * 真凭据，靠 `test/ci-models.yml`（被 `test/ci-agent-dir.ts` 原样装成 `<agentDir>/models.yml`）
+ * 里那个免鉴权的假 provider 顶上。这里把它的 baseUrl 指向的端点起起来，只回 401：
+ *
+ * - 鉴权错误对轮次是**终止性**的，宿主立刻结束这一轮。换成连不上的端点（如 `127.0.0.1:1`）
+ *   会被反复重试，把「首轮结束」的 90s 等待吃满（同一套断言：138s → 2.6s）。
+ * - 断言只看渠道语义（入站卡片落进真宿主会话 jsonl、线上帧），落盘发生在 prompt 提交时，
+ *   不依赖模型回话，所以 401 就够；顺带守着「模型不可用时渠道照旧收/发」。
+ *
+ * 只在本文件的夹具被原样装了进来时启动：本地真 agentDir（真凭据/真模型）完全不碰端口。
+ * 端口从夹具的 baseUrl 解析，两边不会各写一份。
+ */
+function startMockModelEndpoint(): { port: number; stop: () => void } | undefined {
+	const fixturePath = path.join(import.meta.dir, "ci-models.yml");
+	const configuredPath = path.join(agentDir, "models.yml");
+	let configured: string;
+	try {
+		configured = fs.readFileSync(configuredPath, "utf8");
+	} catch {
+		return undefined; // 没配 models.yml 的 agentDir：走宿主自己的模型解析
+	}
+	if (configured !== fs.readFileSync(fixturePath, "utf8")) return undefined;
+
+	const baseUrl = /baseUrl:\s*(\S+)/.exec(configured)?.[1];
+	const port = baseUrl ? Number(new URL(baseUrl).port) : Number.NaN;
+	if (!Number.isInteger(port) || port <= 0) {
+		throw new Error(`${fixturePath} 的 baseUrl 解析不出端口：${baseUrl ?? "(无 baseUrl)"}`);
+	}
+	try {
+		const server = Bun.serve({
+			port,
+			hostname: "127.0.0.1",
+			fetch: () =>
+				new Response(JSON.stringify({ error: { message: "e2e：假模型端点，只回 401（CI 无凭据）" } }), {
+					status: 401,
+					headers: { "content-type": "application/json" },
+				}),
+		});
+		return { port, stop: () => server.stop(true) };
+	} catch (error) {
+		throw new Error(`起假模型端点 127.0.0.1:${port} 失败（端口被占？）：${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+const mockModel = startMockModelEndpoint();
+console.log(
+	mockModel
+		? `模型端点：假端点 127.0.0.1:${mockModel.port}（agentDir 装的是 ci-models.yml，只回 401）`
+		: `模型端点：宿主自己解析（agentDir ${agentDir}，无 ci-models.yml）`,
+);
+
 const mock: MockIrcServer | undefined = EXTERNAL ? undefined : await startMockIrcServer();
 const [serverHost, serverPort] = EXTERNAL
 	? (EXTERNAL.split(":", 2) as [string, string])
@@ -362,6 +414,7 @@ human?.destroy();
 // Windows 上被杀的子进程要一点时间才放手：不等它，TEMP 目录会被 cwd 句柄锁住删不掉。
 await Promise.race([host.exited, Bun.sleep(5_000)]);
 await mock?.close();
+mockModel?.stop();
 
 // ── 断言 ────────────────────────────────────────────────────────────────────
 const channelCard = cards.find(card => card.content.includes(MARKERS[0] as string));

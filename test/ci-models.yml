@@ -1,0 +1,25 @@
+# CI 用的最小 models.yml（由 `test/ci-agent-dir.ts` 原样拷成 `<agentDir>/models.yml`）。
+#
+# 为什么要它：真宿主在非交互模式下**必须**能解析出一个会话模型，否则启动即退出
+# （`Set an API key environment variable…` / `No models available.`，见 `src/main.ts`），
+# `e2e:host` 会以「ready 帧都没有」的形式全挂。CI 上没有、也不该有任何真 provider 凭据，
+# 所以这里声明一个**免鉴权**（`auth: none`）的 provider，让宿主起得来。
+#
+# baseUrl 指向**本机 mock 模型端点**（`e2e-host` 起），它只回 401：鉴权错误对轮次是终止性的，
+# 宿主立刻结束这一轮；换成连不上的端点（如 127.0.0.1:1）会被反复重试，把「首轮结束」的 90s
+# 等待吃满（实测 138s → 2.6s）。`e2e:host` 断言的是「入站卡片落进真宿主会话 jsonl」与线上帧，
+# 落盘发生在 prompt 提交时、不依赖模型回包；反过来这也守着一条真实语义——模型不可用时渠道照旧收/发。
+#
+# 端口是**本文件与 `test/e2e-host.ts` 之间的契约**：那边只在本文件被原样装成
+# `<agentDir>/models.yml` 时，才从这个 baseUrl 里解析端口并把端点起起来（本地真 agentDir
+# 不碰端口）。换端口只改这一行。
+providers:
+  ci:
+    auth: none
+    api: openai-completions
+    baseUrl: http://127.0.0.1:18931/v1
+    models:
+      - id: ci-model
+        input: [text]
+        contextWindow: 8192
+        maxToken: 1024
