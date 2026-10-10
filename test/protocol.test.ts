@@ -375,20 +375,40 @@ describe("IrcClient（假 socket：分帧与退避）", () => {
 		expect(sockets).toHaveLength(2);
 	});
 
-	test("TCP 已连上但还没注册（001 前）的正文也排队，注册后补发", () => {
-		// 回归：旧实现以「TCP 连上」（connect 事件）为排队界，握手窗口里直接写 PRIVMSG，
-		// 服务端还没认这个客户端 → 451 丢掉；每次重连都会经过这个窗口。
+	// 出站只由 `irc` 工具与 `/irc send` 驱动：它们先查 `status().registered`，注册前根本不发。
+	// 客户端自己**没有**出站队列，`send` 只守 `!socket || !#connected`——所以「未连接就不写」靠这里，
+	// 「未注册就不写」靠工具/命令层；握手窗口（TCP 已连、未回 001）的 `privmsg` 客户端不拦。
+	test("connect 之前 privmsg 不写任何字节；握手窗口的拦截在工具/命令层（客户端只守 !socket || !#connected）", () => {
 		const socket = new FakeSocket();
 		const client = new IrcClient({ host: "mock", port: 6667, nick: "omp", socketFactory: () => socket });
 		clients.push(client);
 		client.start();
-		socket.emit("connect"); // NICK/USER 已发出，但服务端还没回 001
-		client.privmsg("alice", "before 001");
-		expect(socket.writes.filter(line => line.startsWith("PRIVMSG"))).toEqual([]);
+		// socket 已建但未连通：连 NICK/USER 都还没发（register 只在 connect 事件里调）。
+		client.privmsg("alice", "x");
+		expect(socket.writes).toEqual([]);
 
-		socket.emit("data", ":mock 001 omp :welcome\r\n");
-		expect(socket.writes).toContain("PRIVMSG alice :before 001\r\n");
+		// 握手窗口：已 TCP 连通、尚未收到 001 → `#connected` 为真，客户端照样写。
+		socket.emit("connect");
+		expect(client.status().registered).toBe(false);
+		client.privmsg("alice", "x");
+		expect(socket.writes).toContain("PRIVMSG alice :x\r\n");
 	});
+
+	test("stop() 之后 privmsg 不抛错也不写任何字节", () => {
+		const socket = new FakeSocket();
+		const client = new IrcClient({ host: "mock", port: 6667, nick: "omp", socketFactory: () => socket });
+		clients.push(client);
+		client.start();
+		socket.emit("connect");
+		socket.emit("data", ":mock 001 omp :welcome\r\n");
+		expect(client.status().registered).toBe(true);
+
+		client.stop();
+		const before = socket.writes.length;
+		expect(() => client.privmsg("alice", "x")).not.toThrow();
+		expect(socket.writes.length).toBe(before);
+	});
+
 });
 
 describe("IrcClient（mock IRC server：真 TCP）", () => {
@@ -408,17 +428,6 @@ describe("IrcClient（mock IRC server：真 TCP）", () => {
 		await server.waitForNick("omp");
 		server.ping("tok-123");
 		expect(await server.waitForLine(/^PONG :tok-123$/)).toBe("PONG :tok-123");
-	});
-
-	test("注册完成前发出的正文排队，注册后按序补发（不静默丢消息）", async () => {
-		const server = await startServer();
-		const client = startClient(server);
-		// 这一行发出时 TCP 还没连上：必须排队，而不是被丢掉。
-		client.privmsg("alice", "early message");
-		await server.waitForJoin("#omp");
-		expect(await server.waitForLine(/^PRIVMSG alice :early message$/)).toBe("PRIVMSG alice :early message");
-		const lines = server.received;
-		expect(lines.indexOf("JOIN #omp")).toBeLessThan(lines.indexOf("PRIVMSG alice :early message"));
 	});
 
 	test("入站 PRIVMSG 私聊/频道、NOTICE、JOIN 事件", async () => {

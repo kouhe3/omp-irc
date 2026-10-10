@@ -1,7 +1,7 @@
 /**
  * 扩展配置：`<agentDir>/irc.json`（可选） + 环境变量 `IRC_*` 覆盖。
  *
- * 默认值刻意宽松：不配任何东西时扩展照样加载（工具/命令/peer 目录都在），只是不会去连
+ * 默认值刻意宽松：不配任何东西时扩展照样加载（工具/命令/会话目录都在），只是不会去连
  * IRC server，`/irc status` 会逐条说明缺什么、怎么补。
  *
  * 只支持一个 server（多网络并行不在 v1 范围，见 README）；SASL 不做，`password` 只是
@@ -13,7 +13,7 @@ import * as path from "node:path";
 
 /**
  * 扩展自己用的最小日志面，避免核心模块依赖宿主 `pi.logger` 的具体类型。
- * 放在 config.ts（本扩展最底层、无内部依赖的模块）里，供 client/peers/transcript/bridge 共用。
+ * 放在 config.ts（本扩展最底层、无内部依赖的模块）里，供 client/conversations/transcript/inbound 共用。
  */
 export interface IrcLogger {
 	info(message: string, meta?: Record<string, unknown>): void;
@@ -37,13 +37,13 @@ export interface IrcConfig {
 	port: number;
 	/** 是否 TLS（`tls.connect`，默认按系统 CA 校验）。 */
 	tls: boolean;
-	/** 连接用的最终昵称 = `nick` + `-` + 展开后的实例后缀；也是私聊 peer 的目标名。 */
+	/** 连接用的最终昵称 = `nick` + `-` + 展开后的实例后缀；也是私聊的目标名。 */
 	nick: string;
 	/** 启动即 JOIN 的频道（缺省为空：只收私聊）。 */
 	channels: string[];
 	/** IRC 连接密码（`PASS`，配给需要 server password 的网关）；不是 SASL。 */
 	password?: string;
-	/** 每个 peer 的 jsonl 转录落脚目录。 */
+	/** 每个会话的 jsonl 转录落脚目录。 */
 	transcriptDir: string;
 	/** 心跳间隔（秒）：>0 启用（静默这么久就发 `PING`）；0 = 关闭。缺省 60。 */
 	keepaliveSeconds: number;

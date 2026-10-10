@@ -6,6 +6,11 @@
  * 512 字节上限切分、断线指数退避重连并在重连后重新 JOIN。**不做** SASL / IRCv3 扩展
  * （见 README）。
  *
+ * 出站不做「未注册就排队」，也不在客户端里拦未注册：`privmsg`/`notice` 只在 **socket 已连上**
+ * 时写出（{@link IrcClient.send}），是否「已注册」由调用方先查 `status().registered`
+ * （`irc` 工具与 `/irc send` 都查，见 src/tool.ts、src/commands.ts）——握手窗口（TCP 已连、
+ * 001 未到）里写进去的 PRIVMSG 会被服务端按 451 丢掉，所以那一层必须挡在前面。
+ *
  * 可测性：socket 由 {@link SocketFactory} 注入（默认 net.connect / tls.connect），
  * 定时器由 {@link IrcTimers} 注入，因此重连退避与协议解析都能在 `bun test` 下无网络断言。
  */
@@ -15,9 +20,6 @@ import type { IrcLogger } from "./config";
 
 /** IRC 行（含 CRLF 前）的字节上限，RFC1459 §2.3。 */
 export const MAX_IRC_BYTES = 512;
-
-/** 未连上时最多排队多少条 PRIVMSG/NOTICE（超出丢最旧的，避免长时间断线吃内存）。 */
-export const MAX_PENDING_OUT = 64;
 
 /** 客户端实际用到的 socket 面（net.Socket / tls.TLSSocket 都满足，工厂里做一次断言）。 */
 export interface IrcSocket {
@@ -68,7 +70,7 @@ export interface IrcInboundMessage {
 	/** 频道名（含 #/&）或我们的 nick（私聊）。 */
 	target: string;
 	text: string;
-	/** 目标是不是频道（决定 peer 是频道会话还是私聊会话）。 */
+	/** 目标是不是频道（决定会话是频道还是私聊）。 */
 	channel: boolean;
 	/** NOTICE 而不是 PRIVMSG。 */
 	notice: boolean;
@@ -245,8 +247,6 @@ export class IrcClient {
 	readonly #max: number;
 	/** 期望留驻的频道；重连成功后据此重新 JOIN（也是 `status().channels`）。 */
 	readonly #desired = new Set<string>();
-	/** 未注册/断线期间排队的出站正文：注册成功后补发，避免静默丢消息。 */
-	readonly #pendingOut: string[] = [];
 	#nick: string;
 	#socket?: IrcSocket;
 	#buffer = "";
@@ -310,7 +310,6 @@ export class IrcClient {
 		const socket = this.#socket;
 		this.#socket = undefined;
 		this.#buffer = "";
-		this.#pendingOut.length = 0;
 		this.#connected = false;
 		this.#registered = false;
 		if (socket) {
@@ -333,13 +332,13 @@ export class IrcClient {
 	/** 发一条 PRIVMSG；正文按 512 字节上限切分成多条。 */
 	privmsg(target: string, text: string): void {
 		const budget = payloadBudget("PRIVMSG", this.#nick, this.#username, target);
-		for (const chunk of splitByBytes(text, budget)) this.#out(`PRIVMSG ${target} :${chunk}`);
+		for (const chunk of splitByBytes(text, budget)) this.send(`PRIVMSG ${target} :${chunk}`);
 	}
 
 	/** 发一条 NOTICE；同样按上限切分。 */
 	notice(target: string, text: string): void {
 		const budget = payloadBudget("NOTICE", this.#nick, this.#username, target);
-		for (const chunk of splitByBytes(text, budget)) this.#out(`NOTICE ${target} :${chunk}`);
+		for (const chunk of splitByBytes(text, budget)) this.send(`NOTICE ${target} :${chunk}`);
 	}
 
 	/** JOIN 并记住它（重连后会自动重新 JOIN）。未注册时只记住。 */
@@ -371,18 +370,6 @@ export class IrcClient {
 		} catch (error) {
 			this.#emitError(error instanceof Error ? error : new Error(String(error)));
 		}
-	}
-
-	/** 对话正文的出站：还没注册就排队（有界），001 之后按序补发。 */
-	#out(line: string): void {
-		// 以「注册完成」而不是「TCP 连上」为界：握手窗口（连上 → 001）里服务端还没认这个
-		// 客户端，此刻直接写 PRIVMSG 只会被 451 丢掉；每次重连都要经过这个窗口。
-		if (this.#registered) {
-			this.send(line);
-			return;
-		}
-		if (this.#pendingOut.length >= MAX_PENDING_OUT) this.#pendingOut.shift();
-		this.#pendingOut.push(line);
 	}
 
 	status(): IrcClientStatus {
@@ -549,8 +536,6 @@ export class IrcClient {
 				this.#armKeepalive();
 				// 重连后的重新 JOIN：desired 是留驻频道集合，这里一次性补上。
 				for (const channel of this.#desired) this.send(`JOIN ${channel}`);
-				// 断线期间排队的对话正文按序补发。
-				for (const line of this.#pendingOut.splice(0)) this.send(line);
 				return;
 			}
 			case "433": {

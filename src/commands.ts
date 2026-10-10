@@ -6,17 +6,22 @@
  */
 import type { IrcClientStatus } from "./client";
 import type { IrcConfig, IrcLogger } from "./config";
-import { describePeer, resolveOrCreatePeer, type PeerDirectory, type PeerRecord } from "./peers";
+import {
+	describeConversation,
+	resolveOrCreateConversation,
+	type ConversationDirectory,
+	type ConversationRecord,
+} from "./conversations";
 import { formatTranscriptDigest, type TranscriptEntry } from "./transcript";
 
 export const IRC_HELP = [
 	"/irc 子命令：",
-	"- status：连接/注册/频道/已登记 peer + 配置说明（默认）",
+	"- status：连接/注册/频道/已知会话 + 配置说明（默认）",
 	"- connect：连接 IRC server（session 启动时已自动连接；断开后用这条重连）",
-	"- disconnect：断开并停止自动重连（peer 登记与转录保留，connect 可随时回来）",
-	"- list：已知 IRC 会话（id / 别名 / 最近活跃）",
-	"- log <peer> [条数]：最近的完整消息记录（主会话卡片正文有上限，长文看这里）",
-	"- say <peer> <正文>：以本会话身份发一条 PRIVMSG（模型侧照旧用 write agent://<peer>）",
+	"- disconnect：断开并停止自动重连（会话登记与转录保留，connect 可随时回来）",
+	"- list：已知 IRC 会话（id / 类型 / 最近活跃）",
+	"- log <peer> [条数]：该会话的完整收发记录（原文与顺序；出站长文切成的多条也在这）",
+	"- send <peer> <正文>：以本会话身份发一条 PRIVMSG（模型侧用 irc 工具 action=send）",
 	"- join <#频道>：JOIN 并记为留驻频道（重连后自动重新 JOIN）",
 	"- part <#频道>：PART 并取消留驻",
 ].join("\n");
@@ -41,7 +46,7 @@ export function splitVerb(args: string): VerbArgs {
 	return { verb: head.slice(0, cut), restRaw: head.slice(cut + 1).trim() };
 }
 
-/** 前缀引用的 token 上限：别名超过这么多词就按正文处理。 */
+/** 前缀引用的 token 上限：引用超过这么多词就按正文处理。 */
 const MAX_REFERENCE_TOKENS = 4;
 
 interface ReferenceCandidate {
@@ -50,7 +55,7 @@ interface ReferenceCandidate {
 }
 
 /**
- * 按引用长度递增列出候选（peer 引用允许含空格，正文跟在后面，边界天然有歧义）。
+ * 按引用长度递增列出候选（会话引用允许含空格，正文跟在后面，边界天然有歧义）。
  * 取「前 N 个 token」逐个试、**最短命中优先**：最长优先更容易把正文开头的 token 吃进
  * 引用里，那种错会静默发给别人。
  */
@@ -92,13 +97,13 @@ export interface IrcCommandDeps {
 	config: IrcConfig;
 	/** 启动配置说明（缺 server 等），status 原样列出。 */
 	notes: string[];
-	peers: PeerDirectory;
+	conversations: ConversationDirectory;
 	client: IrcCommandChannel;
 	/** connect / disconnect 子命令的执行面。 */
 	connection: IrcConnectionControl;
-	/** 出站投递（与 PeerDirectory 用的是同一个实现：发 PRIVMSG 并落转录）。 */
-	send: (peer: PeerRecord, text: string) => Promise<void>;
-	transcripts: { tail(peerId: string, limit: number): TranscriptEntry[]; pathFor(peerId: string): string };
+	/** 出站投递（发 PRIVMSG + 落转录）；工具层用的是同一个实现。 */
+	send: (record: ConversationRecord, text: string) => Promise<void>;
+	transcripts: { tail(id: string, limit: number): TranscriptEntry[]; pathFor(id: string): string };
 	logger: IrcLogger;
 }
 
@@ -120,7 +125,7 @@ function statusText(deps: IrcCommandDeps): string {
 		`IRC：${connectionState(deps)}（${endpoint}）`,
 		`昵称：${status.nick}`,
 		`留驻频道：${status.channels.length > 0 ? status.channels.join("、") : "(无)"}`,
-		`已登记 peer：${deps.peers.list().length}`,
+		`已知会话：${deps.conversations.list().length}`,
 		...deps.notes.map(note => `· ${note}`),
 	];
 	return lines.join("\n");
@@ -158,46 +163,52 @@ export async function runIrcCommand(deps: IrcCommandDeps, args: string): Promise
 			case "disconnect": {
 				if (!deps.connection.isStarted()) return { text: "IRC 未在连接（无需断开）", level: "info" };
 				deps.connection.disconnect();
-				return { text: "已断开 IRC 并停止自动重连（peer 登记与转录保留，/irc connect 可重连）", level: "info" };
+				return { text: "已断开 IRC 并停止自动重连（会话登记与转录保留，/irc connect 可重连）", level: "info" };
 			}
 			case "list": {
-				const known = deps.peers.list();
+				const known = deps.conversations.list();
 				return {
-					text: known.length ? [`已知 IRC 会话 ${known.length} 个：`, ...known.map(describePeer)].join("\n") : "还没有 IRC 会话",
+					text: known.length ? [`已知 IRC 会话 ${known.length} 个：`, ...known.map(describeConversation)].join("\n") : "还没有 IRC 会话",
 					level: "info",
 				};
 			}
 			case "log": {
-				// 末尾的纯数字 token 当条数，其余当作 peer 引用（别名里可以有空格）。
+				// 末尾的纯数字 token 当条数，其余当作会话引用（显示名里可以有空格）。
 				const last = rest[rest.length - 1];
 				const tailArgs = last !== undefined && /^\d+$/.test(last) ? rest.slice(0, -1) : rest;
 				const reference = tailArgs.join(" ").trim();
-				const known = deps.peers.list();
-				const peer = reference ? deps.peers.resolve(reference) : known.length === 1 ? known[0] : undefined;
-				if (!peer) {
+				const known = deps.conversations.list();
+				const record = reference ? deps.conversations.resolve(reference) : known.length === 1 ? known[0] : undefined;
+				if (!record) {
 					return {
 						text:
 							known.length === 0
 								? "还没有 IRC 会话"
-								: `用法：/irc log <peer|nick|频道|别名> [条数]\n${known.map(describePeer).join("\n")}`,
+								: `用法：/irc log <peer|nick|频道> [条数]\n${known.map(describeConversation).join("\n")}`,
 						level: known.length === 0 ? "info" : "warning",
 					};
 				}
 				const limit = Math.min(50, Math.max(1, last !== undefined && /^\d+$/.test(last) ? Number(last) : 6));
-				const file = deps.transcripts.pathFor(peer.id);
-				return { text: formatTranscriptDigest(deps.transcripts.tail(peer.id, limit), file), level: "info" };
+				const file = deps.transcripts.pathFor(record.id);
+				return { text: formatTranscriptDigest(deps.transcripts.tail(record.id, limit), file), level: "info" };
 			}
-			case "say": {
+			case "send": {
 				const candidates = referenceCandidates(restRaw);
-				const known = candidates.find(candidate => deps.peers.resolve(candidate.reference) !== undefined);
+				const known = candidates.find(candidate => deps.conversations.resolve(candidate.reference) !== undefined);
 				const raw = candidates[0];
-				// 已经聊过的引用按最短命中；否则把最短的一个当原始 nick/频道当场登记（主动开口）。
-				const target = known ? deps.peers.resolve(known.reference) : raw ? resolveOrCreatePeer(deps.peers, raw.reference, Date.now()) : undefined;
+				const reference = known?.reference ?? raw?.reference;
+				if (!reference) return { text: "用法：/irc send <peer|nick|频道> <正文>", level: "warning" };
 				const body = known?.body ?? raw?.body ?? "";
-				if (!target) return { text: "用法：/irc say <peer|nick|频道|别名> <正文>", level: "warning" };
-				if (!body) return { text: `用法：/irc say ${target.id} <正文>`, level: "warning" };
-				const status = deps.client.status();
-				if (!status.registered) return { text: "IRC 未连接/未注册，消息未发出（/irc status 看原因）", level: "warning" };
+				if (!body) return { text: `用法：/irc send ${reference} <正文>`, level: "warning" };
+				// 先查连接再登记：未注册时直接拒绝，不留下幽灵会话。
+				if (!deps.client.status().registered) {
+					return { text: "IRC 未连接/未注册，消息未发出（/irc status 看原因）", level: "warning" };
+				}
+				// 已经聊过的引用按最短命中；否则把最短的一个当原始 nick/频道当场登记（主动开口）。
+				const target = known
+					? deps.conversations.resolve(reference)
+					: deps.conversations.ensureTarget(reference, Date.now());
+				if (!target) return { text: `用法：/irc send ${reference} <正文>`, level: "warning" };
 				await deps.send(target, body);
 				return { text: `已发送到 ${target.id}（${body.length} 字符）`, level: "info" };
 			}
