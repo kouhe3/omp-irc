@@ -537,10 +537,15 @@ describe("IrcClient（mock IRC server：真 TCP）", () => {
 		}
 
 		// 裸 CR（没有 LF，splitByBytes 不切）只能靠 send() 压平：正文里 `\r` → 空格。
-		const before = server.received.length;
+		// 等待要盯**这条 PRIVMSG 本身**：注册完成后的 `JOIN #omp` 可能比它晚到（Linux 跑出来的
+		// 就是这个顺序），拿「received 变长」当信号会先被 JOIN 满足，最后一行就不是正文了。
+		const expected = "PRIVMSG alice :x QUIT :bye";
+		const privmsgs = (): string[] => server.received.filter(line => line.startsWith("PRIVMSG alice :"));
 		client.privmsg("alice", "x\rQUIT :bye");
-		await server.waitUntil(() => server.received.length > before, "裸 CR 的 PRIVMSG 到达服务端");
-		expect(server.received.at(-1)).toBe("PRIVMSG alice :x QUIT :bye");
+		await server.waitUntil(() => privmsgs().includes(expected), "裸 CR 的 PRIVMSG 到达服务端");
+		expect(privmsgs().at(-1)).toBe(expected);
+		// 没被拆出第二条命令：裸 CR 若漏成行终止符，这里会多出一条 QUIT。
+		expect(server.received.map(line => parseIrcLine(line).command)).not.toContain("QUIT");
 	});
 });
 
