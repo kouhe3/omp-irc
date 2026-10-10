@@ -213,11 +213,11 @@ try {
 		"注入正文把 <system-reminder> 转义成 &lt;system-reminder>（伪造 harness 指令失败）",
 		JSON.stringify(spoofed?.content),
 	);
-	// 转录是全量账本，仍保留**原文**（净化只发生在显示/注入边界）。
+	// 转录是全量账本，保留**正文**（入账剥控制序列、伪换行压空格；harness 标签不转义）。
 	const spoofLines = (await Bun.file(transcripts.pathFor("irc-peerbot")).text()).trim().split("\n");
 	check(
 		spoofLines.some(line => line.includes(spoof)),
-		"转录仍保留未转义的原文",
+		"转录保留正文且不转义 harness 标签",
 		spoofLines.at(-1)?.slice(0, 160) ?? "",
 	);
 

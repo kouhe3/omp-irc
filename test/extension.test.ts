@@ -218,7 +218,30 @@ test("子会话不连接/不改编注入目标/不清理，主会话接管并负
 	expect(server.received.filter(line => line.startsWith("NICK "))).toEqual([`NICK ${EXPECTED_NICK}`]);
 	expect(server.received.filter(line => line === "JOIN #life")).toHaveLength(1);
 
-	// ── 5) 子会话 session_shutdown：不断开、不清目录、不清状态栏 ────────────────────
+	// ── 5) `/irc disconnect` 只停传输层：会话登记与转录留在原地，connect 回来还能用 ────
+	// 放在步骤 4 的 NICK/JOIN 计数断言之后，才不污染那份「全进程只握手一次」的取证。
+	const command = main.command()?.handler;
+	expect(typeof command).toBe("function");
+	await command?.("disconnect", mainCtx); // 斜杠命令的 args 不含命令名本身
+	await server.waitUntil(() => !server.nicks().includes(EXPECTED_NICK), "断开后掉线");
+	expect(server.nicks()).not.toContain(EXPECTED_NICK);
+	// 「只停传输层」：登记没被清（若 disconnectRuntime 里 clear() 了目录，下面这条会变成
+	// 「还没有任何 IRC 会话」）。
+	const afterDisconnect = await main.tool()?.execute("list-disconnect", { action: "list" }, undefined, undefined, mainCtx);
+	expect(afterDisconnect?.content[0]?.text).toContain("irc-ircpeer");
+
+	await command?.("connect", mainCtx);
+	await server.waitForNick(EXPECTED_NICK);
+	await server.waitForJoin("#life");
+	const afterReconnect = await main.tool()?.execute("list-reconnect", { action: "list" }, undefined, undefined, mainCtx);
+	expect(afterReconnect?.content[0]?.text).toContain("irc-ircpeer");
+	// 转录路径仍由同一个 id 派生：重连后用重启前那个句柄能解析回同一条会话。
+	const reconnectLog = await main.tool()?.execute("log-reconnect", { action: "log", peer: "irc-ircpeer" }, undefined, undefined, mainCtx);
+	expect(reconnectLog?.isError).toBeUndefined();
+	expect(reconnectLog?.content[0]?.text).toContain("irc-ircpeer.jsonl");
+	expect(reconnectLog?.content[0]?.text).toContain("hi from ircpeer");
+
+	// ── 6) 子会话 session_shutdown：不断开、不清目录、不清状态栏 ────────────────────
 	await sub.handlers.session_shutdown?.({}, subCtx);
 	expect(server.nicks()).toContain(EXPECTED_NICK); // client.stop() 没被调用
 	expect(server.channelsOf(EXPECTED_NICK)).toContain("#life");
@@ -226,7 +249,7 @@ test("子会话不连接/不改编注入目标/不清理，主会话接管并负
 	const afterSubShutdown = await main.tool()?.execute("list-sub-shutdown", { action: "list" }, undefined, undefined, mainCtx);
 	expect(afterSubShutdown?.content[0]?.text).toContain("irc-ircpeer"); // 会话目录仍在
 
-	// ── 6) 主会话 session_shutdown：清状态栏、清目录、停连接 ─────────────────────────
+	// ── 7) 主会话 session_shutdown：清状态栏、清目录、停连接 ─────────────────────────
 	await main.handlers.session_shutdown?.({}, mainCtx);
 	expect(main.statuses.at(-1)).toBeUndefined();
 	const afterMainShutdown = await main.tool()?.execute("list-main-shutdown", { action: "list" }, undefined, undefined, mainCtx);

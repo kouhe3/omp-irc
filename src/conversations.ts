@@ -14,7 +14,7 @@
  * 不做持久化：id 由 nick/频道名直接派生，重启后按需重建（内存表本身也不落盘）。
  */
 import { createHash } from "node:crypto";
-import { sanitizeForDisplay } from "./transcript";
+import { sanitizeSingleLine } from "./transcript";
 
 /** 会话类型：IRC 频道（#/&）或私聊。 */
 export type ConversationScope = "channel" | "query";
@@ -118,7 +118,8 @@ export interface ConversationRecord {
 export function describeConversation(record: ConversationRecord): string {
 	const scope = record.scope === "query" ? "私聊" : "频道";
 	const when = new Date(record.lastSeen).toISOString().replace("T", " ").slice(0, 16);
-	return sanitizeForDisplay(`${record.id} ${scope} · 最近活跃 ${when}（${record.targetId}）`);
+	// 单行化：list 是一行一个会话，targetId 里的 U+2028 不能凭空多造一行。
+	return sanitizeSingleLine(`${record.id} ${scope} · 最近活跃 ${when}（${record.targetId}）`);
 }
 
 export interface ConversationDirectoryOptions {
@@ -199,12 +200,20 @@ export class ConversationDirectory {
 	/**
 	 * 模型/用户给的引用 → 会话：支持会话 id、显示名、原始 nick/频道名，
 	 * 全部大小写不敏感。
+	 *
+	 * **id 必须优先于名字**：id 是唯一回复句柄，而对端可以把 nick 起成别条记录的 id
+	 * （nick `irc-alice` 之于 `alice` 的 id `irc-alice`，nick `irc-chan-~homp` 之于频道
+	 * `#omp` 的 id）。若在同一次遍历里让名字和 id 平等竞争，命中就由**登记先后**决定：
+	 * 先登记的那条赢，模型从受害者卡片拿到的句柄会被解析到对端，回复静默发给别人。
+	 * 所以顺序固定为「先 id 精确命中（等价 Map.get），未命中才回退名字」。
 	 */
 	resolve(reference: string): ConversationRecord | undefined {
 		const needle = reference.trim().toLowerCase();
 		if (!needle) return undefined;
+		const byId = this.#conversations.get(needle);
+		if (byId) return byId;
 		for (const record of this.#conversations.values()) {
-			if (record.id === needle || record.targetId.toLowerCase() === needle) return record;
+			if (record.targetId.toLowerCase() === needle) return record;
 			if (record.displayName.toLowerCase() === needle) return record;
 		}
 		return undefined;

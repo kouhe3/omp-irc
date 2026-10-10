@@ -7,7 +7,8 @@ agent 对等通话：
   `deliverAs: "steer"`；卡片末尾带回复指引）。
 - **出站**：模型调 `irc` 工具 `send`，人用 `/irc send` 命令——出站只有这两条路。
 - **转录**：每个会话一份**宿主会话文件格式**的 jsonl（首行是合法 session header，`omp render`
-  之类宿主工具能直接看）；`irc log` / `/irc log` 读的是**原文**。
+  之类宿主工具能直接看；入账剥控制序列，见「与宿主的接口面」）；`irc log` / `/irc log`
+  读的是**正文**。
 - **实例专属昵称**：昵称默认带工作区后缀（`D:/JXAI` → `omp-jxai`），本机多个 omp 实例连同一频道也分得清。
 
 渠道是**独立**的：不注册 AgentRegistry、不建 peer 替身，也不走 `IrcBus` / `deliverIrcMessage` /
@@ -101,7 +102,7 @@ QQ 渠道是单例，IRC 不是：**同一台机器上的每个 omp 进程都是
 | --- | --- |
 | `irc send` / `/irc send <peer> <正文>` | 发一条 PRIVMSG；引用支持会话 id / nick / 频道 / 显示名。**还没聊过的 nick 会当场登记**，不必等对方先开口 |
 | `irc list` / `/irc list` | 已知会话（id / 类型 / 最近活跃 / 原始目标） |
-| `irc log` / `/irc log <peer> [条数]` | 某个会话的收发账本（原文；出站长文会在 512 字节处切成多条 PRIVMSG，这里能看到完整正文与顺序）；省略 `<peer>` 且只有一个会话时自动选它 |
+| `irc log` / `/irc log <peer> [条数]` | 某个会话的收发账本（正文；出站长文会在 512 字节处切成多条 PRIVMSG，这里能看到完整正文与顺序）；省略 `<peer>` 且只有一个会话时自动选它 |
 | `irc join` / `/irc join <#频道>` | JOIN 并记为**留驻频道**（断线重连后自动重新 JOIN）；缺 `#` 自动补 |
 | `irc status` / `/irc status` | 连接/注册/留驻频道/已知会话数 + 配置说明 |
 | `/irc connect` | 连接 IRC server（主会话 `session_start` 已自动连；断开后用这条重连） |
@@ -194,18 +195,29 @@ id 是 `(类型, 原始目标)` 的**纯函数**：不随收发/淘汰顺序变�
 扩展注入的是裸 custom 记录，没有 `[ASIDE_MESSAGE_DISCARD]`/`COMMIT` 钩子，所以丢弃是静默的、
 扩展侧拿不到回调去补投（宿主自己的 `irc:incoming` 同样如此，属上游问题）。
 
-**兜底**：无论走哪条路，入站**原文永远先落渠道账本**（`transcriptDir` 下每个会话一份 jsonl），
-所以被宿主丢掉的入站消息不会真的消失——`irc log` / `/irc log <peer>` 能读回原文，
-模型也可以据此补看（代价是它当时没被唤起）。
+**兜底**：无论走哪条路，入站**正文永远先落渠道账本**（`transcriptDir` 下每个会话一份 jsonl，
+不截断、不切分、不改顺序），所以被宿主丢掉的入站消息不会真的消失——`irc log` /
+`/irc log <peer>` 能读回正文，模型也可以据此补看（代价是它当时没被唤起）。
 - **注入净化**：卡片正文由扩展渲染（`[#omp] alice: hi` + 末尾回复指引），整串过 `stripControl`
   ——nick 与正文都是 IRC 来的不可信输入，对端不该能靠 ESC/OSC 序列操纵运维者的终端。
   同时过 `escapeHarnessTags`（与宿主 `session/harness-tags.ts` 同一份规则）：扩展注入的自定义
   消息是 developer 角色内容，系统提示声明 `<system-*>` / `<irc …>` 这类块由 harness 自己写，
-  对端不该能借这条通道伪造 harness 指令。**转录里仍是原文**（显示前才净化）。
-- **卡片单行化**：正文里的行终止符（`\r`、`\n`、U+2028/U+2029）压成空格——一张卡片 = 一条
-  IRC 消息，否则对端能在卡片里伪造「另一个人发言」或伪造下面那行回复指引。
+  对端不该能借这条通道伪造 harness 指令。
+  唯一的例外是**服务端给的昵称**（`001` 的第一个参数，服务端可任意改）：它既进状态栏（宿主
+  自己净化那一格）又进 `irc status` / `/irc status` 文案，后者在 `src/tool.ts` / `src/commands.ts`
+  的出口过 `sanitizeSingleLine`。
+- **落盘也净化（`sanitizeForLedger`）**：转录是宿主**直接渲染**的目标（`omp render`、
+  Agent Hub 的 fullscreen 转录视图），实测 `omp render` 会把正文里的 ESC 逐字节打到终端上
+  （OSC 52 写剪贴板 / OSC 8 伪造链接 / 清屏）。所以入账前剥掉 ESC/CSI/OSC 等控制序列，并把
+  「伪换行」（裸 CR、U+2028/U+2029）压成空格；**LF 保留**（只可能来自我们自己的出站多行正文），
+  harness 标签**不转义**（账本留正文，模型读日志时由 display 那一层转义）。
+- **单行化（所有显示/注入出口，不只卡片）**：正文里的行终止符（`\r`、`\n`、U+2028/U+2029）
+  一律压成空格——一张卡片/一行日志 = 一条 IRC 消息。否则对端能在卡片里伪造「另一个人发言」
+  或那行回复指引，也能在 `irc log` 的 digest 里伪造一行 `[omp] …`（模型会把 digest 当账本读）。
+  出口共用 `sanitizeSingleLine`（`src/transcript.ts`）：入站卡片、`irc log`/`/irc log` 的 digest、
+  `irc list`/`/irc list` 的会话行、`status` 里的昵称。
 - **正文长度**：入站一张卡片 = 一条 IRC 消息（RFC1459 单行 ≤512 字节，扩展不额外截断）；
-  出站长文由客户端按 512 字节切成多条 PRIVMSG，对端看到的是分段。转录与 `irc log` 保留原文与顺序。
+  出站长文由客户端按 512 字节切成多条 PRIVMSG，对端看到的是分段。转录与 `irc log` 保留正文与顺序。
 - **回复指引**：卡片正文末尾固定跟一行 `回复：irc 工具 {...}`——放在正文之后，正文再长也不会被埋在开头。
 - **清理**：`session_shutdown` 时停客户端、清空会话目录、清掉状态栏那一格；子会话
   （`kind: "sub"`）不连接也不清理——IRC 连接是进程级单例，只归主会话。
@@ -280,13 +292,15 @@ logging:
 - `test/mock-irc-server.ts`：`net.createServer` 的 mock IRC server（真 TCP、真线格式，按 IRC 语义转发频道/私聊消息）。
 - `test/protocol.test.ts`：CRLF 分帧、`parseIrcLine`、512 字节切分、注册/`PING`→`PONG`/`JOIN`/433/退避重连与重新 JOIN、心跳（半开连接判死）。
 - `test/conversations.test.ts`：会话 id 编解码（纯函数：安全名拿基 id，有损名带 16 位哈希、与 scope 绑定）+ 会话目录（登记/解析/淘汰/淘汰后重建仍同 id）+ 入站注入管线（假 `InboundInjector` 断言 `irc:message` 卡片、`deliverAs: "steer"`、回复指引、净化、harness 标签转义）。
-- `test/transcript.test.ts`：转录格式、原文不截断、滚动窗口、尾部读取、显示前净化。
+- `test/transcript.test.ts`：转录格式、入账净化（剥控制序列 / 伪换行压空格）、正文不截断、滚动窗口、尾部读取、显示前净化。
+- `test/tool.test.ts`：`irc` 工具的五个 action（send 的未注册拒绝与不留幽灵会话、log 的解析与条数上限、list、join、status）。
+- `test/extension.test.ts`：`index.ts` 的装配与生命周期（真 socket + stub `ExtensionAPI`）：主会话连接/注册/JOIN、子会话不连接也不改编注入目标、退出清理。
 - `test/commands.test.ts`：`/irc connect|disconnect` 的决策与文案（未配置时不碰客户端、已在连接不重复 start、
   断开后 `status` 给出重连入口）、`status` 的连接状态机（未连接 / 连接中 / 重连中 / 已注册）、
   `send` 的引用解析与未注册时的拒绝。
 - `test/config.test.ts`：实例专属昵称的推导（工作区标签收敛与哈希退化、`nickSuffix` 模板/关闭/长度上限、
   env 覆盖、notes 文案）。
 - `test/e2e-mock.ts`（`bun run e2e`）：真 TCP + mock server + 假注入面：入站注入断言、工具/命令出站 PRIVMSG 上线、512 切分、断线重连后重新 JOIN、`/irc disconnect` 期间 `/irc send` 拒绝；另含 `index.ts` 的装配冒烟（stub `ExtensionAPI`，不需要 `AgentRegistry`）。
-- `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock ircd（`IRC_E2E_SERVER=host:port` 可改连外部 ircd），证明扩展在真宿主里 JOIN 后，入站频道/私聊消息以 `irc:message` 卡片落进真宿主会话 jsonl（扩展自己的转录里同样有原文），`/irc send` 出站上线。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。
+- `test/e2e-host.ts`（`bun run e2e:host`）：真 `omp` 进程 + mock ircd（`IRC_E2E_SERVER=host:port` 可改连外部 ircd），证明扩展在真宿主里 JOIN 后，入站频道/私聊消息以 `irc:message` 卡片落进真宿主会话 jsonl（扩展自己的转录里同样有正文），`/irc send` 出站上线。宿主默认取 PATH 上的 `omp`，要验证 fork/源码宿主用 `IRC_E2E_OMP=<fork>/packages/coding-agent/src/cli.ts bun run e2e:host` —— `Bun.spawn(["omp"])` 会先命中本扩展 `node_modules/.bin/omp`（devDependency 钉的发行版）。
 
 测试不睡真实时间：等待全部走事件驱动的 `Gate` / `server.waitForLine` / `server.waitUntil`。

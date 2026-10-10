@@ -12,7 +12,7 @@ import {
 	type ConversationDirectory,
 	type ConversationRecord,
 } from "./conversations";
-import { formatTranscriptDigest, type TranscriptEntry } from "./transcript";
+import { formatTranscriptDigest, sanitizeSingleLine, type TranscriptEntry } from "./transcript";
 
 export const IRC_HELP = [
 	"/irc 子命令：",
@@ -20,7 +20,7 @@ export const IRC_HELP = [
 	"- connect：连接 IRC server（session 启动时已自动连接；断开后用这条重连）",
 	"- disconnect：断开并停止自动重连（会话登记与转录保留，connect 可随时回来）",
 	"- list：已知 IRC 会话（id / 类型 / 最近活跃）",
-	"- log <peer> [条数]：该会话的完整收发记录（原文与顺序；出站长文切成的多条也在这）",
+	"- log <peer> [条数]：该会话的完整收发记录（正文与顺序；出站长文切成的多条也在这）",
 	"- send <peer> <正文>：以本会话身份发一条 PRIVMSG（模型侧用 irc 工具 action=send）",
 	"- join <#频道>：JOIN 并记为留驻频道（重连后自动重新 JOIN）",
 	"- part <#频道>：PART 并取消留驻",
@@ -123,7 +123,8 @@ function statusText(deps: IrcCommandDeps): string {
 	const endpoint = status.server ? `${status.server}:${status.port}${status.tls ? " TLS" : " 明文"}` : "未配置";
 	const lines = [
 		`IRC：${connectionState(deps)}（${endpoint}）`,
-		`昵称：${status.nick}`,
+		// nick 取自服务端（001 的第一个参数），进终端前必须净化。
+		`昵称：${sanitizeSingleLine(status.nick)}`,
 		`留驻频道：${status.channels.length > 0 ? status.channels.join("、") : "(无)"}`,
 		`已知会话：${deps.conversations.list().length}`,
 		...deps.notes.map(note => `· ${note}`),
@@ -156,7 +157,7 @@ export async function runIrcCommand(deps: IrcCommandDeps, args: string): Promise
 				deps.connection.connect();
 				const status = deps.client.status();
 				return {
-					text: `已发起连接 ${status.server}:${status.port}${status.tls ? "（TLS）" : ""}，昵称 ${status.nick}；结果看状态栏或 /irc status`,
+					text: `已发起连接 ${status.server}:${status.port}${status.tls ? "（TLS）" : ""}，昵称 ${sanitizeSingleLine(status.nick)}；结果看状态栏或 /irc status`,
 					level: "info",
 				};
 			}
@@ -205,10 +206,8 @@ export async function runIrcCommand(deps: IrcCommandDeps, args: string): Promise
 					return { text: "IRC 未连接/未注册，消息未发出（/irc status 看原因）", level: "warning" };
 				}
 				// 已经聊过的引用按最短命中；否则把最短的一个当原始 nick/频道当场登记（主动开口）。
-				const target = known
-					? deps.conversations.resolve(reference)
-					: deps.conversations.ensureTarget(reference, Date.now());
-				if (!target) return { text: `用法：/irc send ${reference} <正文>`, level: "warning" };
+				// 用工具层同一份 helper（`resolve` 未命中才登记），别在命令层再手写一遍这个分支。
+				const target = resolveOrCreateConversation(deps.conversations, reference, Date.now());
 				await deps.send(target, body);
 				return { text: `已发送到 ${target.id}（${body.length} 字符）`, level: "info" };
 			}

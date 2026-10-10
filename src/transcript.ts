@@ -2,9 +2,9 @@
  * 每个 IRC 会话一份「宿主会话文件格式」的 jsonl 转录。
  *
  * 目的：注入主会话的卡片一次只承载一条消息（RFC1459 单行 ≤512 字节），出站长文还会被切成
- * 多条 PRIVMSG；这份文件保留**原文与顺序**，供 `/irc log`（人）与 `irc log`（模型）读完整
- * 来往。渠道自己写、自己读，不依赖宿主的任何会话视图（IRC 会话不是 omp 子会话，
- * 见 src/conversations.ts）。
+ * 多条 PRIVMSG；这份文件保留**正文与顺序**（入账剥控制序列，见 {@link sanitizeForLedger}），
+ * 供 `/irc log`（人）与 `irc log`（模型）读完整来往。渠道自己写、自己读，不依赖宿主的任何
+ * 会话视图（IRC 会话不是 omp 子会话，见 src/conversations.ts）。
  *
  * 格式（对着真实会话文件抄的）：
  *   {"type":"session","version":3,"id":"…","timestamp":"…","cwd":"…"}      ← 首行必须是合法 header
@@ -16,14 +16,18 @@
  * - 单文件超过 {@link MAX_TRANSCRIPT_BYTES} 就轮转：保留最后 {@link KEEP_TRANSCRIPT_BYTES}
  *   字节内的完整行 + 重写 header（滚动窗口，磁盘与读取成本有界）。
  * - `tail()` 只从文件尾读一段，不做全量 `readFileSync`。
- * - 落盘的是原文；**显示**前必须过 `stripControl`。
+ * - 落盘**不截断、不切分、不改顺序**（全量账本），但入账前过 {@link sanitizeForLedger}：
+ *   剥掉终端控制序列、把「伪换行」压成空格。这份文件是宿主会直接渲染的目标
+ *   （`omp render`、Agent Hub 的转录视图），把对端的 ESC/OSC 原样写进去等于给对端
+ *   开了一条「正文 → 运维者终端」的通道；控制序列对账本的可读性也零价值。
+ * - **显示**（卡片、digest、list、status）另过 {@link sanitizeSingleLine}，多一步 harness 标签转义。
  * - 文件名直接由会话 id 派生（会话 id 已收敛为 `[a-z0-9_-]`，天然是安全文件名）。
  */
 import { appendFileSync, mkdirSync, openSync, closeSync, readSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import type { IrcLogger } from "./config";
 
-/** 一条要进转录的消息（IRC 收到的原文 / 我们发出去的回话）。 */
+/** 一条要进转录的消息（IRC 收到的正文 / 我们发出去的回话）。 */
 export interface TranscriptEntry {
 	role: "user" | "assistant";
 	/** 完整正文：**不要**传截断过的卡片正文。 */
@@ -94,7 +98,11 @@ export class IrcTranscripts {
 
 			const parentId = this.#lastEntry.get(conversationId) ?? headerId(conversationId);
 			const id = entryId();
-			const text = entry.senderName ? `${entry.senderName}: ${entry.text}` : entry.text;
+			// 入账净化（见 sanitizeForLedger）：署名与正文都是 IRC 来的不可信输入，而这份文件
+			// 会被宿主渲染到终端上。
+			const text = entry.senderName
+				? `${sanitizeForLedger(entry.senderName)}: ${sanitizeForLedger(entry.text)}`
+				: sanitizeForLedger(entry.text);
 			const message =
 				entry.role === "user"
 					? { role: "user", content: [{ type: "text", text }], attribution: "user", timestamp: ts }
@@ -231,7 +239,8 @@ export const DEFAULT_DIGEST: TranscriptDigestOptions = { perEntry: 2_000, total:
 
 /**
  * 终端显示的净化：IRC 消息是**不可信输入**（对方可以用 ESC/OSC 序列操纵运维者的终端）。
- * 落盘的转录仍保留原文（那是数据）；只有「要显示给人/模型看」的文本过这里。
+ * 这是最底层的一道（显示与落盘两层都建在它上面）：{@link sanitizeForLedger} 用它剥控制序列，
+ * {@link sanitizeForDisplay} 再叠 harness 标签转义。
  */
 export function stripControl(text: string): string {
 	const ESC = "\u001b";
@@ -304,13 +313,46 @@ export function escapeHarnessTags(text: string): string {
 
 /**
  * 不可信输入 → 要显示给终端或送进模型上下文的文本：剥控制序列 + 转义 harness 标签。
- * 落盘的转录仍保留原文；**显示/注入边界**必须走这里。
+ * **显示/注入边界**必须走这里（落盘走 {@link sanitizeForLedger}，不转义 harness 标签）。
  */
 export function sanitizeForDisplay(text: string): string {
 	return escapeHarnessTags(stripControl(text));
 }
 
-/** 逐行渲染最近若干条；**过 stripControl**（消息原文是不可信输入）。 */
+/**
+ * 不可信输入 → 可安全入账的文本：剥控制序列 + 把「伪换行」压成空格。
+ *
+ * 为什么入账也要净化：转录文件是**宿主会直接渲染的目标**（`omp render`、
+ * Agent Hub 的 fullscreen 转录视图），对端在 PRIVMSG 正文里塞的 ESC/OSC
+ * （OSC 52 写剪贴板、OSC 8 伪造链接、清屏…）会被宿主原样打到运维者终端上——
+ * 实测 `omp render <转录音>` 逐字节透出对端的 `ESC[31m`。控制序列对「全量账本」
+ * 没有任何信息价值，剥掉不损失正文。
+ *
+ * 换行只保留 **LF**：协议正文里的 LF 只可能来自我们自己的出站多行文本（入站一行
+ * 一条 PRIVMSG，服务端 CRLF 分帧，正文里不可能有裸 CR/LF）。裸 CR 与 U+2028/U+2029
+ * 对端能塞进正文，被渲染器当换行就会凭空多出一行冒充别人发言，这里压成空格。
+ *
+ * 与 {@link sanitizeForDisplay} 的区别：这里**不转义 harness 标签**（转录是账本，
+ * 要留原文；模型读它时走 display 那一层再转义）。
+ */
+export function sanitizeForLedger(text: string): string {
+	// 先把「伪换行」压成空格（CR / CRLF / U+2028 / U+2029），LF 保持不动。
+	return stripControl(text.replace(/\r\n?|[\u2028\u2029]/g, " "));
+}
+
+/**
+ * 不可信输入 → **单行**文本：净化 + 把所有行终止符压成空格。
+ *
+ * 为什么必须单行化：一张卡片/一行日志就是一条 IRC 消息。压行之前，对端用 U+2028/U+2029
+ * （经 {@link stripControl} 归一成 `\n`）就能在正文里造出**第二行**，伪造「另一个人发言」
+ * ——卡片末尾的回复指引、digest 的 `[omp] …` 行都能被仿出来。控制字符对显示没有任何
+ * 价值，压掉不损信息（要原文的去读转录文件）。
+ */
+export function sanitizeSingleLine(text: string): string {
+	return sanitizeForDisplay(text).replace(/\n+/g, " ");
+}
+
+/** 逐行渲染最近若干条；**整套净化 + 单行化**（消息原文是不可信输入，见 {@link sanitizeSingleLine}）。 */
 export function formatTranscriptDigest(
 	entries: readonly TranscriptEntry[],
 	file: string,
@@ -321,7 +363,7 @@ export function formatTranscriptDigest(
 	if (entries.length === 0) return `还没有消息记录（文件：${file}）`;
 	const body = entries.map(entry => {
 		const who = entry.role === "assistant" ? "omp" : "irc";
-		const text = sanitizeForDisplay(entry.text);
+		const text = sanitizeSingleLine(entry.text);
 		const trimmed = text.length > perEntry ? `${text.slice(0, perEntry)}…（本条见文件）` : text;
 		return `[${who}] ${trimmed}`;
 	});

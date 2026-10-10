@@ -503,6 +503,40 @@ describe("IrcClient（mock IRC server：真 TCP）", () => {
 		expect(client.status().registered).toBe(true);
 		expect(server.channelsOf("omp")).toContain("#omp");
 	});
+
+	test("出站正文里的裸 CR/LF 不能变成第二条 IRC 命令（行注入防线）", async () => {
+		// 正文可能来自对端（模型转述）或用户输入：原样带 `\r\n` 写出就会在线上多一行，
+		// `QUIT` / `OPER` 之类都成了我们能发出的命令。两道防线叠起来：
+		// `\n` 由 splitByBytes 当硬断点切开，剩下的裸 CR 由 send() 压成空格——
+		// 服务端永远只看到 PRIVMSG，且正文里不留任何行终止符。
+		const server = await startServer();
+		const client = startClient(server);
+		await server.waitForNick("omp");
+
+		client.privmsg("alice", "hi\r\nQUIT :bye");
+		await server.waitUntil(
+			() => server.received.filter(line => line.startsWith("PRIVMSG alice :")).length >= 2,
+			"CRLF 正文切成两条 PRIVMSG 到达服务端",
+		);
+
+		// 帧里只有 PRIVMSG：没有任何一条独立的命令（QUIT 没被执行）。
+		expect(server.received.map(line => parseIrcLine(line).command)).not.toContain("QUIT");
+		const bodies = server.received
+			.filter(line => line.startsWith("PRIVMSG alice :"))
+			.map(line => parseIrcLine(line).params[1] ?? "");
+		expect(bodies).toHaveLength(2);
+		expect(bodies.join(" ")).toContain("QUIT :bye"); // 正文内容没丢，只是断了行
+		for (const body of bodies) {
+			expect(body).not.toContain("\r");
+			expect(body).not.toContain("\n");
+		}
+
+		// 裸 CR（没有 LF，splitByBytes 不切）只能靠 send() 压平：正文里 `\r` → 空格。
+		const before = server.received.length;
+		client.privmsg("alice", "x\rQUIT :bye");
+		await server.waitUntil(() => server.received.length > before, "裸 CR 的 PRIVMSG 到达服务端");
+		expect(server.received.at(-1)).toBe("PRIVMSG alice :x QUIT :bye");
+	});
 });
 
 describe("parseIrcLine", () => {

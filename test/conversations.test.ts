@@ -68,7 +68,11 @@ function buildPipeline(options: { limit?: number; now?: () => number } = {}): Pi
 		transcripts,
 		// 入参是渲染好的卡片正文；回复指引行里的 peer 就是管线合成的真实会话 id。
 		deliver: body => {
-			peers.push(/"peer":"([^"]+)"/.exec(body)?.[1] ?? "");
+			const peer = /"peer":"([^"]+)"/.exec(body)?.[1];
+			// 取不到说明回复指引的格式变了：宁可在这里炸，也不要让断言退化成
+			// `expected "" to be "irc-peerbot"` 那种指错方向的失败（`?? ""` 就是那个坑）。
+			if (!peer) throw new Error(`入站卡片里没有回复指引的 peer：${body.slice(0, 200)}`);
+			peers.push(peer);
 			sink(body);
 		},
 		selfNick: () => "omp",
@@ -91,7 +95,6 @@ describe("encodeConversationId", () => {
 		expect(encodeConversationId("channel", "&omp")).toBe("irc-chan-~lomp");
 		// `#omp` 与 `&omp` 是两个不同频道：不能收敛成同一个 id。
 		expect(encodeConversationId("channel", "#omp")).not.toBe(encodeConversationId("channel", "&omp"));
-		expect(CONVERSATION_ID_PREFIX).toBe("irc");
 	});
 
 	test("有损名：会被收敛撞车的目标带 16 位短哈希，彼此分开且可复现", () => {
@@ -208,6 +211,8 @@ describe("会话 id 编解码", () => {
 		expect(text).toContain("irc-evil 私聊 · 最近活跃 2024-01-02 03:04");
 		expect(text.includes("\u001b")).toBe(false);
 		expect(text.includes("\u2028")).toBe(false);
+		// 单行化：U+2028 曾被归一成 `\n` 留在这里，于是 list 的一行会凭空变成两行。
+		expect(text.includes("\n")).toBe(false);
 		expect(text.includes("<system-")).toBe(false);
 		expect(text).toContain("&lt;system-reminder>");
 	});
@@ -292,6 +297,32 @@ describe("ConversationDirectory", () => {
 			expect(dir.resolve(targetA)).toBe(first);
 			expect(dir.resolve(targetB)).toBe(second);
 		}
+	});
+
+	test("同形 nick 劫持：nick 起成别条记录的 id 时，id 仍精确命中自己那条（与登记顺序无关）", () => {
+		// 回归：resolve 曾在**一次**遍历里让「名字」和「id」平等竞争，命中由登记先后决定。
+		// 对端只要把 nick 起成别人的会话 id（`irc-alice` 之于 `alice` 的 id `irc-alice`，
+		// 都是合法 nick 字符），先登记的那条就赢：模型从受害者卡片拿到的句柄被解析到对端，
+		// 回复静默发给别人。所以 id 必须优先，且与登记顺序无关。
+		for (const attackerFirst of [true, false]) {
+			const dir = new ConversationDirectory({ limit: 10 });
+			const attacker = dir.ensure({ scope: "query", targetId: "irc-alice", timestamp: attackerFirst ? 1 : 2 });
+			const victim = dir.ensure({ scope: "query", targetId: "alice", timestamp: attackerFirst ? 2 : 1 });
+			expect(victim.id).toBe("irc-alice");
+			expect(attacker.id).toBe("irc-irc-alice");
+			// 句柄（id）永远解析到自己那条；对端的昵称只在对端**自己的 id** 被引用时命中。
+			expect(dir.resolve("irc-alice")).toBe(victim);
+			expect(dir.resolve("irc-irc-alice")).toBe(attacker);
+			expect(dir.resolve("alice")).toBe(victim);
+		}
+
+		// 频道同理：nick 起成频道句柄 `irc-chan-~homp` 也劫持不了 #omp。
+		const dir = new ConversationDirectory({ limit: 10 });
+		const fake = dir.ensure({ scope: "query", targetId: "irc-chan-~homp", timestamp: 1 });
+		const channel = dir.ensure({ scope: "channel", targetId: "#omp", timestamp: 2 });
+		expect(channel.id).toBe("irc-chan-~homp");
+		expect(dir.resolve("irc-chan-~homp")).toBe(channel);
+		expect(dir.resolve(fake.id)).toBe(fake);
 	});
 
 	test("ensure 同一目标多次：只有一条记录，id 稳定不变（含带哈希的有损名）", () => {
@@ -438,7 +469,7 @@ describe("入站管线（createInboundHandler + createHostSink）", () => {
 		expect(pipeline.calls[0]?.message.content.startsWith("[NOTICE 私聊] Carol: psst")).toBe(true);
 	});
 
-	test("nick 与正文的 ESC/OSC 被剥掉；转录保留原文", () => {
+	test("nick 与正文的 ESC/OSC 被剥掉（卡片与转录都不带控制序列）", () => {
 		const pipeline = buildPipeline();
 		pipeline.onInbound(inbound({ from: "\u001b[31mAlice", text: "好\u001b[31m红\u001b[0m色" }));
 		const content = pipeline.calls[0]?.message.content ?? "";
@@ -446,7 +477,9 @@ describe("入站管线（createInboundHandler + createHostSink）", () => {
 		expect(content.includes("\u001b")).toBe(false);
 		const id = pipeline.peers[0] ?? "";
 		expect(id.startsWith("irc-")).toBe(true);
-		expect(pipeline.transcripts.tail(id, 1)[0]?.text).toBe("\u001b[31mAlice: 好\u001b[31m红\u001b[0m色");
+		// 转录同样是宿主会渲染的目标（omp render / Agent Hub 转录视图）：控制序列一起剥掉，
+		// 正文与顺序照旧完整（账本不截断、不切分）。
+		expect(pipeline.transcripts.tail(id, 1)[0]?.text).toBe("Alice: 好红色");
 	});
 
 	test("入站卡片：harness 标签被转义；裸 CR / U+2028 压成单行（不能伪造发言行）", () => {

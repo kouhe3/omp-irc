@@ -14,7 +14,7 @@
  */
 import type { IrcInboundMessage } from "./client";
 import { type ConversationDirectory, type ConversationScope } from "./conversations";
-import { sanitizeForDisplay, type TranscriptEntry } from "./transcript";
+import { sanitizeSingleLine, type TranscriptEntry } from "./transcript";
 
 /** 注入用的自定义消息类型（TUI 卡片标题与宿主转录里的 `customType`）。 */
 export const IRC_INCOMING_TYPE = "irc:message";
@@ -57,11 +57,12 @@ export function createHostSink(inject: InboundInjector): (body: string) => void 
  * 入站正文的统一渲染：`[#omp] alice: hi` / `[私聊] alice: hi`（NOTICE 标出来），
  * 末尾另起一行给出回复方式（渠道没有代发，模型必须显式调用工具）。
  *
- * 整串过 {@link sanitizeForDisplay}（剥 ESC/OSC 等控制序列 + 转义 harness 标签：
+ * 整串过 {@link sanitizeSingleLine}（剥 ESC/OSC 等控制序列 + 转义 harness 标签：
  * 宿主把扩展注入的自定义消息当 developer 内容原样交给模型，而系统提示声明 `<system-*>` /
  * `<irc ...>` 这类块是 harness 自己写的——对端不该能靠这条通道伪造 harness 指令），
  * 再把所有行终止符压成空格：一张卡片 = 一条 IRC 消息，否则对端能用裸 CR / U+2028
- * 在卡片里伪造「另一个人发言」，甚至伪造下面那行回复指引。转录里仍是原文。
+ * 在卡片里伪造「另一个人发言」，甚至伪造下面那行回复指引。转录里仍是完整正文
+ * （落盘另过 sanitizeForLedger 剥控制序列，见 src/transcript.ts）。
  */
 export function formatInboundBody(event: {
 	/** 会话 id（目录按 (类型, 原始目标) 算出的纯函数；名字有损时带 16 位短哈希）——模型回复时用它。 */
@@ -74,9 +75,7 @@ export function formatInboundBody(event: {
 }): string {
 	const where = event.scope === "channel" ? event.targetId : "私聊";
 	const kind = event.notice ? "NOTICE " : "";
-	const body = sanitizeForDisplay(`[${kind}${where}] ${event.senderNick}: ${event.content}`)
-		.replace(/\n+/g, " ")
-		.trim();
+	const body = sanitizeSingleLine(`[${kind}${where}] ${event.senderNick}: ${event.content}`).trim();
 	// 用法单独成行跟在正文之后，模型照抄即可（正文本身就是不可信输入，这一行是扩展自己写的）。
 	return `${body}\n\n回复：irc 工具 {"action":"send","peer":"${event.id}","text":"<正文>"}`;
 }
@@ -104,7 +103,7 @@ export function createInboundHandler(options: InboundPipelineOptions): (message:
 		const targetId = message.channel ? message.target : message.from;
 		const ts = options.now?.() ?? Date.now();
 		const record = options.conversations.ensure({ scope, targetId, timestamp: ts });
-		// 先落原文再注入：转录是**全量账本**（含出站长文被切分的多条），`irc log` 读它。
+		// 先落正文再注入：转录是**全量账本**（含出站长文被切分的多条），`irc log` 读它。
 		options.transcripts.record(record.id, { role: "user", text: message.text, ts, senderName: message.from });
 		options.deliver(
 			formatInboundBody({

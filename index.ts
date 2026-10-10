@@ -6,7 +6,8 @@
  *   config → IrcTranscripts → ConversationDirectory → IrcClient → 入站注入
  * （注入口先建好、每个主会话 session_start 换代；会话目录与客户端随后挂上去。）
  * 与宿主之间只有两个面（都是公开扩展 API）：
- *   入站：`pi.sendMessage(..., { deliverAs: "followUp", triggerTurn: true })`（src/inbound.ts）
+ *   入站：`pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`（src/inbound.ts，
+ *   四种投递方式的实测取舍见 README「投递方式」）
  *   出站：`irc` 工具与 `/irc send` 命令（IRC 会话**不是** omp 子会话，不注册进 AgentRegistry）
  * 刻意不走宿主 omp 的 IRC 面（IrcBus / peer 替身 / `deliverIrcMessage` / `irc:incoming`）：
  * 那是给 omp 内部 agent 之间通信（子代理编排）设计的，peer 面的语义不属于外部渠道。

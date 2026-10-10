@@ -17,7 +17,8 @@ export interface OutboundSenderDeps {
 
 export function createOutboundSender(deps: OutboundSenderDeps): (record: ConversationRecord, text: string) => Promise<void> {
 	return async (record, text) => {
-		// 出站正文原样落转录（转录是全量账本与原文），再按 512 字节上限切成 PRIVMSG。
+		// 出站正文落转录（全量账本；入账会剥控制序列，见 sanitizeForLedger），再按 512 字节
+		// 上限切成 PRIVMSG。
 		deps.client.privmsg(record.targetId, text);
 		deps.transcripts.record(record.id, { role: "assistant", text });
 		deps.touch(record.id);
